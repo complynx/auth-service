@@ -54,9 +54,9 @@ async fn check_session(
     let session_id = match req.headers().get("X-Session-Id") {
         Some(value) => match value.to_str() {
             Ok(value) => value.to_string(),
-            Err(_) => return HttpResponse::BadRequest().body("Invalid X-Session-Id header"),
+            Err(_) => return HttpResponse::Unauthorized().body("Invalid X-Session-Id header"),
         },
-        None => return HttpResponse::BadRequest().body("Missing X-Session-Id header"),
+        None => return HttpResponse::Unauthorized().body("Missing X-Session-Id header"),
     };
     let mut store = session_store.lock().unwrap();
     if let Some((username, expiration)) = store.get_mut(&session_id) {
@@ -65,10 +65,10 @@ async fn check_session(
             HttpResponse::Ok().append_header(("X-Authenticated-User", username.clone())).finish()
         } else {
             store.remove(&session_id);
-            HttpResponse::Unauthorized().json(ErrorResponse { error: "Expired session" })
+            HttpResponse::Unauthorized().body("Expired session")
         }
     } else {
-        HttpResponse::Unauthorized().json(ErrorResponse { error: "Invalid session" })
+        HttpResponse::Unauthorized().body("Invalid session")
     }
 }
 
@@ -89,6 +89,10 @@ struct Args {
     /// Server binds to this port
     #[arg(short, long, default_value_t = 8080)]
     port: u16,
+
+    /// Server binds to this address
+    #[arg(short, long, default_value = "0.0.0.0")]
+    address: String,
 }
 
 #[actix_web::main]
@@ -111,8 +115,7 @@ async fn main() -> std::io::Result<()> {
             .service(check_session)
             .service(login)
     })
-    .bind(("0.0.0.0", args.port))?
-    .bind(("::", args.port))?
+    .bind((args.address, args.port))?
     .run()
     .await
 }
