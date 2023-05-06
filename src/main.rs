@@ -77,21 +77,26 @@ fn get_google_email(token: &oauth2::AccessToken) -> Result<String, Box<dyn std::
     Ok(email)
 }
 
+fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let ret = req.headers()
+        .get(key)
+        .ok_or(format!("Header {} not found", key))?
+        .to_str()?;
+    Ok(ret.to_string())
+}
+
 #[get("/auth/login")]
 async fn login(
     req: HttpRequest,
     web::Query(data): web::Query<CodeResponse>,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
-    let session_id = match req.headers().get("X-Session-Id") {
-        Some(value) => match value.to_str() {
-            Ok(value) => value.to_string(),
-            Err(_) => return HttpResponse::Unauthorized().json(ErrorResponse { error: "Bad session ID" }),
-        },
-        None => return HttpResponse::Unauthorized().json(ErrorResponse { error: "No session ID" }),
+    let session_id = match get_header_string(&req, "X-Session-Id") {
+        Ok(value) => value,
+        Err(_) => return HttpResponse::Unauthorized().json(ErrorResponse { error: "No session ID" }),
     };
-    let code =  AuthorizationCode::new(data.code);
-    let state =  CsrfToken::new(data.state);
+    let code = AuthorizationCode::new(data.code);
+    let state = CsrfToken::new(data.state);
 
     let mut auth_store = app_data.session_auth_store.lock().unwrap();
 
@@ -105,25 +110,21 @@ async fn login(
                 .set_pkce_verifier(auth_data.pkce_code_verifier)
                 .request_async(async_http_client)
                 .await;
+
             match token_response {
                 Ok(token_response_unwrapped) => {
-                    let email_result = get_google_email(token_response_unwrapped.access_token());
-                    match email_result {
-                        Ok(email) => {
-                            HttpResponse::Found()
-                                .append_header(("X-Authenticated-User", email.clone()))
-                                .append_header((header::LOCATION, auth_data.source_uri))
-                                .finish()
-                        },
+                    match get_google_email(token_response_unwrapped.access_token()) {
+                        Ok(email) => HttpResponse::Found()
+                            .append_header(("X-Authenticated-User", email.clone()))
+                            .append_header((header::LOCATION, auth_data.source_uri))
+                            .finish(),
                         Err(_) => HttpResponse::InternalServerError()
-                            .json(ErrorResponse { error: "No email found in the JWT"})
+                            .json(ErrorResponse { error: "No email found in the JWT" }),
                     }
                 },
                 Err(_) => HttpResponse::Unauthorized()
-                    .json(ErrorResponse { error: "failed to prove token" })
+                    .json(ErrorResponse { error: "failed to prove token" }),
             }
-
-            
         } else {
             HttpResponse::Unauthorized().json(ErrorResponse { error: "Session expired" })
         }
@@ -137,28 +138,17 @@ async fn renew_session(
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
 
-    let source_method = match req.headers().get("X-Original-Method") {
-        Some(value) => value.to_str().unwrap_or("GET"),
-        None => "GET",
-    };
-    let source_uri = match source_method {
-        "GET" => match req.headers().get("X-Original-URI") {
-            Some(value) => value.to_str().unwrap_or(app_data.authentication_success_url.as_str()),
-            None => app_data.authentication_success_url.as_str(),
-        },
-        _ => app_data.authentication_success_url.as_str()
-    };
-    let redirect_uri = match req.headers().get("X-Redirect-URI") {
-        Some(value) => match value.to_str() {
-            Ok(value) => match RedirectUrl::new(value.to_string()) {
-                Ok(value) => value,
-                Err(err) => return HttpResponse::InternalServerError()
-                    .body(format!("X-Redirect-URI parse error: {}", err))
-            },
+    let source_method = get_header_string(&req, "X-Original-Method").unwrap_or("GET".to_string());
+    let source_uri = if source_method == "GET" {
+        get_header_string(&req, "X-Original-URI").unwrap_or(app_data.authentication_success_url.clone())
+    } else {app_data.authentication_success_url.clone()};
+    let redirect_uri = match get_header_string(&req, "X-Redirect-URI") {
+        Ok(value) => match RedirectUrl::new(value) {
+            Ok(value) => value,
             Err(err) => return HttpResponse::InternalServerError()
-                .body(format!("X-Redirect-URI not a string: {}", err))
+                .body(format!("X-Redirect-URI parse error: {}", err))
         },
-        None => return HttpResponse::InternalServerError().body("redirect_uri not provided")
+        Err(err) => return HttpResponse::InternalServerError().body(format!("X-Redirect-URI header error: {}", err))
     };
     let mut auth_store = app_data.session_auth_store.lock().unwrap();
 
@@ -185,7 +175,7 @@ async fn renew_session(
         session_id.clone(),
         AuthorizationSession{
             client,
-            source_uri: source_uri.to_string(),
+            source_uri,
             timeout: Instant::now() + Duration::from_secs(1800),
             pkce_code_verifier,
             csrf_state,
@@ -208,12 +198,9 @@ async fn check_session(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
-    let session_id = match req.headers().get("X-Session-Id") {
-        Some(value) => match value.to_str() {
-            Ok(value) => value.to_string(),
-            Err(_) => return renew_session(req, app_data).await,
-        },
-        None => return renew_session(req, app_data).await,
+    let session_id = match get_header_string(&req, "X-Session-Id") {
+        Ok(value) => value,
+        Err(_) => return renew_session(req, app_data).await,
     };
     
     let mut store = app_data.session_store.lock().unwrap();
