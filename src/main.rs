@@ -11,10 +11,9 @@ use oauth2::{
     RedirectUrl, Scope, TokenUrl,
 };
 use serde::{Serialize, Deserialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH, SystemTime};
 use uuid::Uuid;
 use actix_web::middleware::Logger;
 use env_logger::Env;
@@ -47,34 +46,34 @@ struct AuthorizationSession {
     csrf_state: CsrfToken,
 }
 
-
-type SessionStore = Arc<Mutex<HashMap<String, (String, Instant)>>>;
 type AuthStore = Arc<Mutex<HashMap<String, AuthorizationSession>>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct AppData {
-    session_store: SessionStore,
     session_auth_store: AuthStore,
     google_client_id: ClientId,
     google_client_secret: ClientSecret,
     authentication_success_url: String,
+    google_keys: Vec<DecodingKey>,
+    jwt_secret: ClientSecret,
 }
 
-fn get_google_email(token: &oauth2::AccessToken) -> Result<String, Box<dyn std::error::Error>> {
-    let decoded_id_token = decode::<Value>(
-        token.secret(),
-        &DecodingKey::from_secret("".as_ref()),
-        &Validation::default(),
-    )?;
+#[derive(Deserialize, Debug)]
+struct GoogleToken {
+    iss: String,
+    sub: String,
+    // aud: String,
+    // azp: String,
+    // iat: usize,
+    // exp: usize,
+    email: String,
+}
 
-    let email = decoded_id_token
-        .claims
-        .get("email")
-        .and_then(|email| email.as_str())
-        .ok_or("No email found for the user")?
-        .to_string();
-
-    Ok(email)
+#[derive(Serialize, Deserialize, Debug)]
+struct AuthToken{
+    sub: String,
+    exp: u64,
+    email: String,
 }
 
 fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -83,6 +82,51 @@ fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std
         .ok_or(format!("Header {} not found", key))?
         .to_str()?;
     Ok(ret.to_string())
+}
+
+fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken, jsonwebtoken::errors::Error> {
+    let mut validation = Validation::default();
+    validation.set_audience(&[&app_data.google_client_id.as_str()]);
+
+    for key in &app_data.google_keys {
+        if let Ok(decoded_token) = decode::<GoogleToken>(token, key, &validation) {
+            if decoded_token.claims.iss == "accounts.google.com" ||
+               decoded_token.claims.iss == "https://accounts.google.com" {
+                return Ok(decoded_token.claims);
+            }
+        }
+    }
+
+    Err(jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidToken))
+}
+
+fn finish_login(app_data: &AppData, source_uri: String, token: GoogleToken) -> HttpResponse {
+    let expiration_seconds = 3600;
+    let exp = SystemTime::now().duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs() + expiration_seconds;
+
+    let claims = AuthToken {
+        sub: token.sub.clone(),
+        email: token.email.clone(),
+        exp,
+    };
+
+    let secret = jsonwebtoken::EncodingKey::from_secret(app_data.jwt_secret.secret().as_bytes());
+
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+    let auth_token = jsonwebtoken::encode(&header, &claims, &secret).unwrap();
+
+    HttpResponse::Found()
+        .cookie(
+            Cookie::build("session_id", auth_token)
+                .path("/")
+                .secure(true)
+                .max_age(CDuration::seconds(expiration_seconds.try_into().unwrap()))
+                .finish(),
+        )
+        .append_header((header::LOCATION, source_uri))
+        .finish()
 }
 
 #[get("/auth/login")]
@@ -113,11 +157,8 @@ async fn login(
 
             match token_response {
                 Ok(token_response_unwrapped) => {
-                    match get_google_email(token_response_unwrapped.access_token()) {
-                        Ok(email) => HttpResponse::Found()
-                            .append_header(("X-Authenticated-User", email.clone()))
-                            .append_header((header::LOCATION, auth_data.source_uri))
-                            .finish(),
+                    match validate_google_token(&app_data, token_response_unwrapped.access_token().secret()) {
+                        Ok(token) => finish_login(&app_data, auth_data.source_uri, token),
                         Err(_) => HttpResponse::InternalServerError()
                             .json(ErrorResponse { error: "No email found in the JWT" }),
                     }
@@ -148,7 +189,8 @@ async fn renew_session(
             Err(err) => return HttpResponse::InternalServerError()
                 .body(format!("X-Redirect-URI parse error: {}", err))
         },
-        Err(err) => return HttpResponse::InternalServerError().body(format!("X-Redirect-URI header error: {}", err))
+        Err(err) => return HttpResponse::InternalServerError()
+            .body(format!("X-Redirect-URI header error: {}", err))
     };
     let mut auth_store = app_data.session_auth_store.lock().unwrap();
 
@@ -193,6 +235,12 @@ async fn renew_session(
         .finish()
 }
 
+fn auth_token_validate(token: &str, app_data: &AppData) -> Result<AuthToken, jsonwebtoken::errors::Error> {
+    let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
+    let secret = jsonwebtoken::DecodingKey::from_secret(app_data.jwt_secret.secret().as_bytes());
+    Ok(decode::<AuthToken>(&token, &secret, &validation)?.claims)
+}
+
 #[get("/auth/check")]
 async fn check_session(
     req: HttpRequest,
@@ -202,26 +250,10 @@ async fn check_session(
         Ok(value) => value,
         Err(_) => return renew_session(req, app_data).await,
     };
-    
-    let mut store = app_data.session_store.lock().unwrap();
-    if let Some((username, expiration)) = store.get_mut(&session_id) {
-        if *expiration > Instant::now() {
-            *expiration = Instant::now() + Duration::from_secs(3600);
-            return HttpResponse::Ok().append_header(("X-Authenticated-User", username.clone())).finish();
-        } else {
-            store.remove(&session_id);
-        }
-    }
-    
-    return renew_session(req, app_data.clone()).await
-}
 
-async fn clean_expired_sessions(session_store: SessionStore) {
-    let mut interval = interval(Duration::from_secs(600));
-    loop {
-        interval.tick().await;
-        let mut store = session_store.lock().unwrap();
-        store.retain(|_, (_, expiration)| *expiration > Instant::now());
+    match auth_token_validate(&session_id, &app_data) {
+        Ok(_) => HttpResponse::Ok().finish(),
+        Err(_) => renew_session(req, app_data.clone()).await
     }
 }
 
@@ -234,48 +266,65 @@ async fn clean_expired_auths(auth_store: AuthStore) {
     }
 }
 
+async fn fetch_google_public_keys() -> Result<Vec<DecodingKey>, Box<dyn std::error::Error>> {
+    const URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
+
+    let response: serde_json::Value = reqwest::get(URL).await?.json().await?;
+
+    let keys = response["keys"].as_array().ok_or("failed to convert keys to array")?;
+
+    let mut decoded_keys = Vec::new();
+
+    for key in keys {
+        let n = key["n"]
+            .as_str()
+            .ok_or("Failed to convert n to string")?;
+        let e = key["e"]
+            .as_str()
+            .ok_or("Failed to convert e to string")?;
+        let decoding_key = DecodingKey::from_rsa_components(n, e)?;
+        decoded_keys.push(decoding_key);
+    }
+    
+    Ok(decoded_keys)
+}
+
+fn env_var(key: &str) -> Result<String, std::io::Error> {
+    env::var(key).map_err(
+        |err| std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Missing the {} environment variable: {}", key, err)
+        )
+    )
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let address = env::var("BIND_ADDRESS").unwrap_or("0.0.0.0:8080".to_string());
-    let google_client_id = ClientId::new(
-        env::var("GOOGLE_CLIENT_ID").map_err(
-            |_| std::io::Error::new(
+    let google_client_id = ClientId::new(env_var("GOOGLE_CLIENT_ID")?);
+    let google_client_secret = ClientSecret::new(env_var("GOOGLE_CLIENT_SECRET")?);
+    let authentication_success_url = env_var("AUTHENTICATION_SUCCESS_URL")?;
+    let jwt_secret = ClientSecret::new(env_var("JWT_SECRET")?);
+    let google_keys = fetch_google_public_keys()
+        .await
+        .map_err(
+            |err| std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "Missing the GOOGLE_CLIENT_ID environment variable."
+                format!("Couldn't fetch google public keys: {}", err)
             )
-        )?,
-    );
-    let google_client_secret = ClientSecret::new(
-        env::var("GOOGLE_CLIENT_SECRET").map_err(
-            |_| std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Missing the GOOGLE_CLIENT_SECRET environment variable."
-            )
-        )?,
-    );
-    let authentication_success_url = env::var("AUTHENTICATION_SUCCESS_URL").map_err(
-        |_| std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Missing the AUTHENTICATION_SUCCESS_URL environment variable."
-        )
-    )?;
+        )?;
 
-    let session_store: SessionStore = Arc::new(Mutex::new(HashMap::new()));
     let session_auth_store: AuthStore = Arc::new(Mutex::new(HashMap::new()));
     let app_data = AppData{
-        session_store,
         session_auth_store,
         google_client_id,
         google_client_secret,
         authentication_success_url,
+        google_keys,
+        jwt_secret,
     };
 
     env_logger::init_from_env(Env::default().default_filter_or("debug"));
-
-    let cleaner_session_store = app_data.session_store.clone();
-    tokio::spawn(async move {
-        clean_expired_sessions(cleaner_session_store).await;
-    });
     let cleaner_session_auth_store = app_data.session_auth_store.clone();
     tokio::spawn(async move {
         clean_expired_auths(cleaner_session_auth_store).await;
