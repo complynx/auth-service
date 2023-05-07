@@ -223,7 +223,7 @@ async fn renew_session(
             csrf_state,
         });
     
-    HttpResponse::Found()
+    HttpResponse::Unauthorized()
         .append_header((header::LOCATION, authorize_url.to_string()))
         .cookie(
             Cookie::build("session_id", session_id.clone())
