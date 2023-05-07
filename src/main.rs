@@ -100,7 +100,13 @@ fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken,
                 }
             },
             Err(err) => {
-                debug!("decode token failed: {}", err);
+                if let jsonwebtoken::errors::ErrorKind::InvalidSignature = err.kind() {
+                    debug!("decode token failed: Invalid signature");
+                } else if let jsonwebtoken::errors::ErrorKind::ExpiredSignature = err.kind() {
+                    debug!("decode token failed: Expired token");
+                } else {
+                    debug!("decode token failed: {}", err);
+                }
             }
         }
     }
