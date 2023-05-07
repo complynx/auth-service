@@ -100,13 +100,7 @@ fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken,
                 }
             },
             Err(err) => {
-                if let jsonwebtoken::errors::ErrorKind::InvalidSignature = err.kind() {
-                    debug!("decode token failed: Invalid signature");
-                } else if let jsonwebtoken::errors::ErrorKind::ExpiredSignature = err.kind() {
-                    debug!("decode token failed: Expired token");
-                } else {
-                    debug!("decode token failed: {}", err);
-                }
+                debug!("decode token failed: {} ({:?})", err, err.kind());
             }
         }
     }
@@ -312,7 +306,18 @@ async fn fetch_google_public_keys() -> Result<Vec<DecodingKey>, Box<dyn std::err
         let e = key["e"]
             .as_str()
             .ok_or("Failed to convert e to string")?;
-        let decoding_key = DecodingKey::from_rsa_components(n, e)?;
+
+        debug!("Key n: {}, e: {}", n, e);
+        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let n_decoded = URL_SAFE_NO_PAD.decode(n)?;
+        let e_decoded = URL_SAFE_NO_PAD.decode(e)?;
+        debug!("Key decoded n: {:?}, e: {:?}", n_decoded, e_decoded);
+
+        let decoding_key = DecodingKey::from_rsa_raw_components(
+            n_decoded.as_slice(),
+            e_decoded.as_slice()
+        );
         decoded_keys.push(decoding_key);
     }
     
