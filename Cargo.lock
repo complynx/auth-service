@@ -250,7 +250,6 @@ name = "auth_service"
 version = "0.1.0"
 dependencies = [
  "actix-web",
- "base64 0.21.0",
  "env_logger",
  "jsonwebtoken",
  "lazy_static",
