@@ -20,6 +20,7 @@ use env_logger::Env;
 use tokio::time::interval;
 use std::env;
 use jsonwebtoken::{decode, DecodingKey, Validation};
+use log::{debug, error, info, trace, warn};
 
 #[derive(Serialize, Debug)]
 struct LoginResponse {
@@ -89,10 +90,17 @@ fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken,
     validation.set_audience(&[&app_data.google_client_id.as_str()]);
 
     for key in &app_data.google_keys {
-        if let Ok(decoded_token) = decode::<GoogleToken>(token, key, &validation) {
-            if decoded_token.claims.iss == "accounts.google.com" ||
-               decoded_token.claims.iss == "https://accounts.google.com" {
-                return Ok(decoded_token.claims);
+        match decode::<GoogleToken>(token, key, &validation) {
+            Ok(decoded_token) => {
+                if decoded_token.claims.iss == "accounts.google.com"
+                || decoded_token.claims.iss == "https://accounts.google.com" {
+                    return Ok(decoded_token.claims);
+                } else {
+                    debug!("iss mismatch");
+                }
+            },
+            Err(err) => {
+                debug!("decode token failed: {}", err);
             }
         }
     }
@@ -137,7 +145,10 @@ async fn login(
 ) -> impl Responder {
     let session_id = match get_header_string(&req, "X-Session-Id") {
         Ok(value) => value,
-        Err(_) => return HttpResponse::Unauthorized().json(ErrorResponse { error: "No session ID" }),
+        Err(err) => {
+            info!("failed to get X-Session-Id from headers: {}", err);
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "No session ID" })
+        },
     };
     let code = AuthorizationCode::new(data.code);
     let state = CsrfToken::new(data.state);
@@ -159,12 +170,18 @@ async fn login(
                 Ok(token_response_unwrapped) => {
                     match validate_google_token(&app_data, token_response_unwrapped.access_token().secret()) {
                         Ok(token) => finish_login(&app_data, auth_data.source_uri, token),
-                        Err(_) => HttpResponse::InternalServerError()
-                            .json(ErrorResponse { error: "No email found in the JWT" }),
+                        Err(err) => {
+                            info!("google token validation failed {}", err);
+                            HttpResponse::InternalServerError()
+                                .json(ErrorResponse { error: "No email found in the JWT" })
+                        },
                     }
                 },
-                Err(_) => HttpResponse::Unauthorized()
-                    .json(ErrorResponse { error: "failed to prove token" }),
+                Err(err) => {
+                    info!("google token fetch failed {}", err);
+                    HttpResponse::Unauthorized()
+                        .json(ErrorResponse { error: "failed to prove token" })
+                },
             }
         } else {
             HttpResponse::Unauthorized().json(ErrorResponse { error: "Session expired" })
@@ -248,12 +265,18 @@ async fn check_session(
 ) -> impl Responder {
     let session_id = match get_header_string(&req, "X-Session-Id") {
         Ok(value) => value,
-        Err(_) => return renew_session(req, app_data).await,
+        Err(err) => {
+            info!("failed to get X-Session-Id from headers: {}", err);
+            return renew_session(req, app_data).await
+        },
     };
 
     match auth_token_validate(&session_id, &app_data) {
         Ok(_) => HttpResponse::Ok().finish(),
-        Err(_) => renew_session(req, app_data.clone()).await
+        Err(err) =>{
+            info!("token validation failed: {}", err);
+            renew_session(req, app_data.clone()).await
+        }
     }
 }
 
@@ -261,6 +284,7 @@ async fn clean_expired_auths(auth_store: AuthStore) {
     let mut interval = interval(Duration::from_secs(600));
     loop {
         interval.tick().await;
+        debug!("Cleaning expired auths");
         let mut store = auth_store.lock().unwrap();
         store.retain(|_, session| session.timeout > Instant::now());
     }
