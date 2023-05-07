@@ -89,6 +89,8 @@ fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken,
     let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_audience(&[&app_data.google_client_id.as_str()]);
 
+    debug!("Trying validate token: token {}, audience {}", token, app_data.google_client_id.as_str());
+
     for key in &app_data.google_keys {
         match decode::<GoogleToken>(token, key, &validation) {
             Ok(decoded_token) => {
@@ -349,7 +351,7 @@ fn env_var(key: &str) -> Result<String, std::io::Error> {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(Env::default().default_filter_or("debug"));
-    
+
     let address = env::var("BIND_ADDRESS").unwrap_or("0.0.0.0:8080".to_string());
     let google_client_id = ClientId::new(env_var("GOOGLE_CLIENT_ID")?);
     let google_client_secret = ClientSecret::new(env_var("GOOGLE_CLIENT_SECRET")?);
