@@ -95,7 +95,7 @@ struct AuthToken{
     email: String,
 }
 
-fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn get_header_string_i(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
     let ret = req.headers()
         .get(key)
         .ok_or(format!("Header {} not found", key))?
@@ -103,12 +103,23 @@ fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std
     Ok(ret.to_string())
 }
 
+fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    match get_header_string_i(req, key) {
+        Ok(s) => {
+            debug!("got header {}: {}", key, s);
+            Ok(s)
+        },
+        Err(e) => {
+            debug!("failed to get header {}: {}", key, e);
+            Err(e)
+        }
+    }
+}
+
 fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken, jsonwebtoken::errors::Error> {
     let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_audience(&[&app_data.google_client_id.as_str()]);
     validation.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
-
-    debug!("Trying validate token: token {}, audience {}", token, app_data.google_client_id.as_str());
 
     for key in &app_data.google_keys {
         match decode::<GoogleToken>(token, key, &validation) {
@@ -120,24 +131,12 @@ fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken,
             }
         }
     }
-    
-    let mut validation_fake = Validation::new(jsonwebtoken::Algorithm::RS256);
-    // validation_fake.set_audience(&[&app_data.google_client_id.as_str()]);
-    // validation_fake.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
-    validation_fake.insecure_disable_signature_validation();
-    match decode::<GoogleToken>(token, &app_data.google_keys[0], &validation_fake) {
-        Ok(decoded_token) => {
-            debug!("decoded token header {:?}, claims {:?}", decoded_token.header, decoded_token.claims);
-        },
-        Err(err) => {
-            debug!("decode token failed: {} ({:?})", err, err.kind());
-        }
-    }
 
     Err(jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidToken))
 }
 
 fn finish_login(app_data: &AppData, source_uri: String, token: GoogleToken) -> HttpResponse {
+    debug!("google token: {:?}", token);
     let expiration_seconds = 3600;
     let exp = SystemTime::now().duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
@@ -166,20 +165,6 @@ fn finish_login(app_data: &AppData, source_uri: String, token: GoogleToken) -> H
         .finish()
 }
 
-pub async fn async_http_client_dbg(
-    request: oauth2::HttpRequest,
-) -> Result<oauth2::HttpResponse, oauth2::reqwest::Error<reqwest::Error>> {
-    let ret = async_http_client(request).await;
-    match ret {
-        Ok(resp) => {
-            let s = std::str::from_utf8(&resp.body).unwrap();
-            debug!("Response from google: status code {}, headers {:?}, body {}", resp.status_code, resp.headers, s);
-            Ok(resp)
-        }
-        Err(e) => Err(e)
-    }
-}
-
 #[get("/auth/login")]
 async fn login(
     req: HttpRequest,
@@ -206,12 +191,11 @@ async fn login(
             let token_response = auth_data.client
                 .exchange_code(code)
                 .set_pkce_verifier(auth_data.pkce_code_verifier)
-                .request_async(async_http_client_dbg)
+                .request_async(async_http_client)
                 .await;
 
             match token_response {
                 Ok(token_response_unwrapped) => {
-                    debug!("token response: {:?}", token_response_unwrapped);
                     match validate_google_token(&app_data, token_response_unwrapped.extra_fields().id_token.as_str()) {
                         Ok(token) => finish_login(&app_data, auth_data.source_uri, token),
                         Err(err) => {
