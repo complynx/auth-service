@@ -148,6 +148,20 @@ fn finish_login(app_data: &AppData, source_uri: String, token: GoogleToken) -> H
         .finish()
 }
 
+pub async fn async_http_client_dbg(
+    request: oauth2::HttpRequest,
+) -> Result<oauth2::HttpResponse, oauth2::reqwest::Error<reqwest::Error>> {
+    let ret = async_http_client(request).await;
+    match ret {
+        Ok(resp) => {
+            let s = std::str::from_utf8(&resp.body).unwrap();
+            debug!("Response from google: status code {}, headers {:?}, body {}", resp.status_code, resp.headers, s);
+            Ok(resp)
+        }
+        Err(e) => Err(e)
+    }
+}
+
 #[get("/auth/login")]
 async fn login(
     req: HttpRequest,
@@ -174,7 +188,7 @@ async fn login(
             let token_response = auth_data.client
                 .exchange_code(code)
                 .set_pkce_verifier(auth_data.pkce_code_verifier)
-                .request_async(async_http_client)
+                .request_async(async_http_client_dbg)
                 .await;
 
             match token_response {
