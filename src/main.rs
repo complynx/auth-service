@@ -303,7 +303,7 @@ async fn main() -> std::io::Result<()> {
     let address = env::var("BIND_ADDRESS").unwrap_or("0.0.0.0:8080".to_string());
     let google_client_id = ClientId::new(env_var("GOOGLE_CLIENT_ID")?);
     let google_client_secret = ClientSecret::new(env_var("GOOGLE_CLIENT_SECRET")?);
-    let authentication_success_url = env_var("AUTHENTICATION_SUCCESS_URL")?;
+    let authentication_success_url = env_var("AUTHENTICATION_SUCCESS_URL").unwrap_or("/".to_string());
     let jwt_secret = ClientSecret::new(env_var("JWT_SECRET")?);
     let google_keys = fetch_google_public_keys()
         .await
