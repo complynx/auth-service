@@ -290,12 +290,25 @@ async fn fetch_google_public_keys() -> Result<Vec<DecodingKey>, Box<dyn std::err
 }
 
 fn env_var(key: &str) -> Result<String, std::io::Error> {
-    env::var(key).map_err(
+    let ret = env::var(key).map_err(
         |err| std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Missing the {} environment variable: {}", key, err)
         )
-    )
+    );
+    match ret {
+        Ok(s) => {
+            if s == "" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Environment variable {} is empty.", key)
+                ));
+            } else {
+                return Ok(s);
+            }
+        },
+        Err(e) => Err(e)
+    }
 }
 
 #[actix_web::main]
