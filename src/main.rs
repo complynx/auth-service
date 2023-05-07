@@ -38,9 +38,26 @@ struct CodeResponse {
     state: String
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GoogleExtraTokenFields {
+    pub id_token: String,
+}
+
+impl oauth2::ExtraTokenFields for GoogleExtraTokenFields {}
+
+pub type GoogleTokenResponse = oauth2::StandardTokenResponse<GoogleExtraTokenFields, oauth2::basic::BasicTokenType>;
+pub type GoogleClient = oauth2::Client<
+    oauth2::basic::BasicErrorResponse,
+    GoogleTokenResponse,
+    oauth2::basic::BasicTokenType,
+    oauth2::basic::BasicTokenIntrospectionResponse,
+    oauth2::StandardRevocableToken,
+    oauth2::basic::BasicRevocationErrorResponse,
+>;
+
 #[derive(Debug)]
 struct AuthorizationSession {
-    client: BasicClient,
+    client: GoogleClient,
     timeout: Instant,
     source_uri: String,
     pkce_code_verifier: oauth2::PkceCodeVerifier,
@@ -58,6 +75,7 @@ struct AppData {
     google_keys: Vec<DecodingKey>,
     jwt_secret: ClientSecret,
 }
+
 
 #[derive(Deserialize, Debug)]
 struct GoogleToken {
@@ -193,7 +211,8 @@ async fn login(
 
             match token_response {
                 Ok(token_response_unwrapped) => {
-                    match validate_google_token(&app_data, token_response_unwrapped.access_token().secret()) {
+                    debug!("token response: {:?}", token_response_unwrapped);
+                    match validate_google_token(&app_data, token_response_unwrapped.extra_fields().id_token.as_str()) {
                         Ok(token) => finish_login(&app_data, auth_data.source_uri, token),
                         Err(err) => {
                             info!("google token validation failed {}", err);
@@ -238,7 +257,7 @@ async fn renew_session(
 
     let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_string())
         .expect("fix your code");
-    let client = BasicClient::new(
+    let client = GoogleClient::new(
         app_data.google_client_id.clone(),
         Some(app_data.google_client_secret.clone()),
         auth_url,
