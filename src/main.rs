@@ -63,10 +63,10 @@ struct AppData {
 struct GoogleToken {
     iss: String,
     sub: String,
-    // aud: String,
-    // azp: String,
-    // iat: usize,
-    // exp: usize,
+    aud: String,
+    azp: String,
+    iat: usize,
+    exp: usize,
     email: String,
 }
 
