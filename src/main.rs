@@ -86,7 +86,7 @@ fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std
 }
 
 fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken, jsonwebtoken::errors::Error> {
-    let mut validation = Validation::default();
+    let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_audience(&[&app_data.google_client_id.as_str()]);
 
     for key in &app_data.google_keys {
