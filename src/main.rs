@@ -348,6 +348,8 @@ fn env_var(key: &str) -> Result<String, std::io::Error> {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    env_logger::init_from_env(Env::default().default_filter_or("debug"));
+    
     let address = env::var("BIND_ADDRESS").unwrap_or("0.0.0.0:8080".to_string());
     let google_client_id = ClientId::new(env_var("GOOGLE_CLIENT_ID")?);
     let google_client_secret = ClientSecret::new(env_var("GOOGLE_CLIENT_SECRET")?);
@@ -372,7 +374,6 @@ async fn main() -> std::io::Result<()> {
         jwt_secret,
     };
 
-    env_logger::init_from_env(Env::default().default_filter_or("debug"));
     let cleaner_session_auth_store = app_data.session_auth_store.clone();
     tokio::spawn(async move {
         clean_expired_auths(cleaner_session_auth_store).await;
