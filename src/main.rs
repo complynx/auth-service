@@ -104,8 +104,8 @@ fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken,
     }
     
     let mut validation_fake = Validation::new(jsonwebtoken::Algorithm::RS256);
-    validation_fake.set_audience(&[&app_data.google_client_id.as_str()]);
-    validation_fake.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
+    // validation_fake.set_audience(&[&app_data.google_client_id.as_str()]);
+    // validation_fake.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
     validation_fake.insecure_disable_signature_validation();
     match decode::<GoogleToken>(token, &app_data.google_keys[0], &validation_fake) {
         Ok(decoded_token) => {
