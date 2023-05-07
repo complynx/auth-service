@@ -88,22 +88,31 @@ fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std
 fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken, jsonwebtoken::errors::Error> {
     let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_audience(&[&app_data.google_client_id.as_str()]);
+    validation.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
 
     debug!("Trying validate token: token {}, audience {}", token, app_data.google_client_id.as_str());
 
     for key in &app_data.google_keys {
         match decode::<GoogleToken>(token, key, &validation) {
             Ok(decoded_token) => {
-                if decoded_token.claims.iss == "accounts.google.com"
-                || decoded_token.claims.iss == "https://accounts.google.com" {
-                    return Ok(decoded_token.claims);
-                } else {
-                    debug!("iss mismatch");
-                }
+                return Ok(decoded_token.claims);
             },
             Err(err) => {
                 debug!("decode token failed: {} ({:?})", err, err.kind());
             }
+        }
+    }
+    
+    let mut validation_fake = Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation_fake.set_audience(&[&app_data.google_client_id.as_str()]);
+    validation_fake.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
+    validation_fake.insecure_disable_signature_validation();
+    match decode::<GoogleToken>(token, &app_data.google_keys[0], &validation_fake) {
+        Ok(decoded_token) => {
+            debug!("decoded token header {:?}, claims {:?}", decoded_token.header, decoded_token.claims);
+        },
+        Err(err) => {
+            debug!("decode token failed: {} ({:?})", err, err.kind());
         }
     }
 
