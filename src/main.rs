@@ -233,7 +233,7 @@ async fn renew_session(
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
     let source_uri = if data.original_method == "GET" && data.original_uri != "" {
-        data.original_uri
+        data.original_uri.clone()
     } else {app_data.authentication_success_url.clone()};
     let redirect_uri = match get_header_string(&req, "X-Redirect-URI") {
         Ok(value) => match RedirectUrl::new(value) {
@@ -244,6 +244,8 @@ async fn renew_session(
         Err(err) => return HttpResponse::InternalServerError()
             .body(format!("X-Redirect-URI header error: {}", err))
     };
+    debug!("source_uri: {}, params: m {}, u {}", source_uri, data.original_method, data.original_uri);
+
     let mut auth_store = app_data.session_auth_store.lock().unwrap();
 
     let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_string())
