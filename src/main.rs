@@ -37,21 +37,6 @@ struct CodeResponse {
     state: String
 }
 
-#[derive(Deserialize, Debug)]
-struct CheckRequest {
-    original_uri: String,
-    original_method: String
-}
-
-impl Default for CheckRequest {
-    fn default() -> Self {
-        CheckRequest {
-            original_uri: "GET".to_string(),
-            original_method: "".to_string(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GoogleExtraTokenFields {
     pub id_token: String,
@@ -143,32 +128,36 @@ fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken,
     Err(jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidToken))
 }
 
-fn finish_login(app_data: &AppData, source_uri: String, token: GoogleToken) -> HttpResponse {
-    debug!("google token: {:?}", token);
+fn create_token_cookie(app_data: &AppData, mut token: AuthToken) -> Cookie {
     let expiration_seconds = 3600;
     let exp = SystemTime::now().duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_secs() + expiration_seconds;
 
-    let claims = AuthToken {
-        sub: token.sub.clone(),
-        email: token.email.clone(),
-        exp,
-    };
+    token.exp = exp;
 
     let secret = jsonwebtoken::EncodingKey::from_secret(app_data.jwt_secret.secret().as_bytes());
 
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-    let auth_token = jsonwebtoken::encode(&header, &claims, &secret).unwrap();
+    let auth_token = jsonwebtoken::encode(&header, &token, &secret).unwrap();
+
+    return Cookie::build("session_id", auth_token)
+        .path("/")
+        .secure(true)
+        .max_age(CDuration::seconds(expiration_seconds.try_into().unwrap()))
+        .finish();
+}
+
+fn finish_login(app_data: &AppData, source_uri: String, token: GoogleToken) -> HttpResponse {
+    debug!("google token: {:?}", token);
+    let claims = AuthToken {
+        sub: token.sub.clone(),
+        email: token.email.clone(),
+        exp: 0,
+    };
 
     HttpResponse::Found()
-        .cookie(
-            Cookie::build("session_id", auth_token)
-                .path("/")
-                .secure(true)
-                .max_age(CDuration::seconds(expiration_seconds.try_into().unwrap()))
-                .finish(),
-        )
+        .cookie(create_token_cookie(app_data, claims))
         .append_header((header::LOCATION, source_uri))
         .finish()
 }
@@ -227,7 +216,7 @@ async fn login(
     }
 }
 
-async fn renew_session(
+async fn start_login(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
@@ -294,6 +283,32 @@ fn auth_token_validate(token: &str, app_data: &AppData) -> Result<AuthToken, jso
     Ok(decode::<AuthToken>(&token, &secret, &validation)?.claims)
 }
 
+#[get("/auth/keep-alive")]
+async fn keep_alive(
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    let session_id = match get_header_string(&req, "X-Session-Id") {
+        Ok(value) => value,
+        Err(err) => {
+            info!("failed to get X-Session-Id from headers: {}", err);
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "no session found to keep alive" })
+        },
+    };
+
+    match auth_token_validate(&session_id, &app_data) {
+        Ok(token) => {
+            HttpResponse::Ok()
+                .cookie(create_token_cookie(&app_data, token))
+                .finish()
+        },
+        Err(err) =>{
+            info!("token validation failed: {}", err);
+            HttpResponse::Unauthorized().json(ErrorResponse { error: "no session found to keep alive" })
+        }
+    }
+}
+
 #[get("/auth/check")]
 async fn check_session(
     req: HttpRequest,
@@ -303,7 +318,7 @@ async fn check_session(
         Ok(value) => value,
         Err(err) => {
             info!("failed to get X-Session-Id from headers: {}", err);
-            return renew_session(req, app_data).await
+            return start_login(req, app_data).await
         },
     };
 
@@ -311,7 +326,7 @@ async fn check_session(
         Ok(_) => HttpResponse::Ok().finish(),
         Err(err) =>{
             info!("token validation failed: {}", err);
-            renew_session(req, app_data.clone()).await
+            start_login(req, app_data.clone()).await
         }
     }
 }
@@ -412,6 +427,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(app_data.clone()))
             .service(check_session)
             .service(login)
+            .service(keep_alive)
     })
     .bind(address)?
     .run()
