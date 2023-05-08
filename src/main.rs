@@ -229,12 +229,9 @@ async fn login(
 
 async fn renew_session(
     req: HttpRequest,
-    data: CheckRequest,
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
-    let source_uri = if data.original_method == "GET" && data.original_uri != "" {
-        data.original_uri.clone()
-    } else {app_data.authentication_success_url.clone()};
+    let source_uri = app_data.authentication_success_url.clone();
     let redirect_uri = match get_header_string(&req, "X-Redirect-URI") {
         Ok(value) => match RedirectUrl::new(value) {
             Ok(value) => value,
@@ -244,7 +241,7 @@ async fn renew_session(
         Err(err) => return HttpResponse::InternalServerError()
             .body(format!("X-Redirect-URI header error: {}", err))
     };
-    debug!("source_uri: {}, params: m {}, u {}", source_uri, data.original_method, data.original_uri);
+    debug!("request: {:?}", req);
 
     let mut auth_store = app_data.session_auth_store.lock().unwrap();
 
@@ -297,14 +294,13 @@ fn auth_token_validate(token: &str, app_data: &AppData) -> Result<AuthToken, jso
 #[get("/auth/check")]
 async fn check_session(
     req: HttpRequest,
-    web::Query(data): web::Query<CheckRequest>,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
     let session_id = match get_header_string(&req, "X-Session-Id") {
         Ok(value) => value,
         Err(err) => {
             info!("failed to get X-Session-Id from headers: {}", err);
-            return renew_session(req, data, app_data).await
+            return renew_session(req, app_data).await
         },
     };
 
@@ -312,7 +308,7 @@ async fn check_session(
         Ok(_) => HttpResponse::Ok().finish(),
         Err(err) =>{
             info!("token validation failed: {}", err);
-            renew_session(req, data, app_data.clone()).await
+            renew_session(req, app_data.clone()).await
         }
     }
 }
