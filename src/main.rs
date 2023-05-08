@@ -3,7 +3,6 @@ use actix_web::{
     HttpRequest, cookie::Cookie, cookie::time::Duration as CDuration,
     http::header
 };
-use oauth2::{basic::BasicClient, TokenResponse};
 // Alternatively, this can be oauth2::curl::http_client or a custom.
 use oauth2::reqwest::async_http_client;
 use oauth2::{
@@ -20,7 +19,7 @@ use env_logger::Env;
 use tokio::time::interval;
 use std::env;
 use jsonwebtoken::{decode, DecodingKey, Validation};
-use log::{debug, error, info, trace, warn};
+use log::{debug, info};
 
 #[derive(Serialize, Debug)]
 struct LoginResponse {
@@ -36,6 +35,21 @@ struct ErrorResponse {
 struct CodeResponse {
     code: String,
     state: String
+}
+
+#[derive(Deserialize, Debug)]
+struct CheckRequest {
+    original_uri: String,
+    original_method: String
+}
+
+impl Default for CheckRequest {
+    fn default() -> Self {
+        CheckRequest {
+            original_uri: "GET".to_string(),
+            original_method: "".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -79,12 +93,7 @@ struct AppData {
 
 #[derive(Deserialize, Debug)]
 struct GoogleToken {
-    iss: String,
     sub: String,
-    aud: String,
-    azp: String,
-    iat: usize,
-    exp: usize,
     email: String,
 }
 
@@ -95,16 +104,15 @@ struct AuthToken{
     email: String,
 }
 
-fn get_header_string_i(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let ret = req.headers()
-        .get(key)
-        .ok_or(format!("Header {} not found", key))?
-        .to_str()?;
-    Ok(ret.to_string())
-}
-
 fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
-    match get_header_string_i(req, key) {
+    fn parse(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let ret = req.headers()
+            .get(key)
+            .ok_or(format!("Header {} not found", key))?
+            .to_str()?;
+        Ok(ret.to_string())
+    }
+    match parse(req, key) {
         Ok(s) => {
             debug!("got header {}: {}", key, s);
             Ok(s)
@@ -221,12 +229,11 @@ async fn login(
 
 async fn renew_session(
     req: HttpRequest,
+    data: CheckRequest,
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
-
-    let source_method = get_header_string(&req, "X-Original-Method").unwrap_or("GET".to_string());
-    let source_uri = if source_method == "GET" {
-        get_header_string(&req, "X-Original-URI").unwrap_or(app_data.authentication_success_url.clone())
+    let source_uri = if data.original_method == "GET" && data.original_uri != "" {
+        data.original_uri
     } else {app_data.authentication_success_url.clone()};
     let redirect_uri = match get_header_string(&req, "X-Redirect-URI") {
         Ok(value) => match RedirectUrl::new(value) {
@@ -246,8 +253,7 @@ async fn renew_session(
         Some(app_data.google_client_secret.clone()),
         auth_url,
         TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).ok(),
-    )
-    .set_redirect_uri(redirect_uri);
+    ).set_redirect_uri(redirect_uri);
     let (pkce_code_challenge, pkce_code_verifier) = PkceCodeChallenge::new_random_sha256();
 
     let (authorize_url, csrf_state) = client
@@ -289,13 +295,14 @@ fn auth_token_validate(token: &str, app_data: &AppData) -> Result<AuthToken, jso
 #[get("/auth/check")]
 async fn check_session(
     req: HttpRequest,
+    web::Query(data): web::Query<CheckRequest>,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
     let session_id = match get_header_string(&req, "X-Session-Id") {
         Ok(value) => value,
         Err(err) => {
             info!("failed to get X-Session-Id from headers: {}", err);
-            return renew_session(req, app_data).await
+            return renew_session(req, data, app_data).await
         },
     };
 
@@ -303,7 +310,7 @@ async fn check_session(
         Ok(_) => HttpResponse::Ok().finish(),
         Err(err) =>{
             info!("token validation failed: {}", err);
-            renew_session(req, app_data.clone()).await
+            renew_session(req, data, app_data.clone()).await
         }
     }
 }
