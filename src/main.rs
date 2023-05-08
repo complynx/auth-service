@@ -231,7 +231,10 @@ async fn renew_session(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
-    let source_uri = app_data.authentication_success_url.clone();
+    let source_method = get_header_string(&req, "X-Original-Method").unwrap_or("GET".to_string());
+    let source_uri = if source_method == "GET" {
+        get_header_string(&req, "X-Original-URI").unwrap_or(app_data.authentication_success_url.clone())
+    } else {app_data.authentication_success_url.clone()};
     let redirect_uri = match get_header_string(&req, "X-Redirect-URI") {
         Ok(value) => match RedirectUrl::new(value) {
             Ok(value) => value,
