@@ -117,15 +117,22 @@ async fn keep_alive(
 
 #[get("/login")]
 async fn login(
-    _req: HttpRequest,
+    req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
     let mut html = String::from("<html><head><title>Login</title></head><body><h1>Login</h1><ul>");
+    let source_uri =match get_header_string(&req, "X-Original-URI") {
+        Ok(value) => value,
+        Err(err) => return HttpResponse::InternalServerError()
+            .body(format!("X-Original-URI header error: {}", err))
+    };
+    let source_path = remove_path_last_part(source_uri.clone());
 
     for plugin_name in app_data.plugins.keys() {
         html.push_str(&format!(
-            r#"<li><a href="/auth/{plugin_name}">{plugin_name}</a></li>"#,
-            plugin_name = plugin_name
+            r#"<li><a href="{source_path}/{plugin_name}/login">{plugin_name}</a></li>"#,
+            plugin_name = plugin_name,
+            source_path = source_path
         ));
     }
 
