@@ -15,6 +15,7 @@ oauth2 = "4.3"
 reqwest = { version = "0.11", features = ["json"]}
 jsonwebtoken = "8.3"
 log = "0.4"
+const_format = "0.2"
 
 [dependencies.uuid]
 version = "1.3.2"

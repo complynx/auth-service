@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, Arc, MutexGuard};
+use std::sync::{Mutex, Arc};
 use std::time::{Duration, Instant};
 
 use actix_web::cookie::Cookie;
@@ -11,29 +11,33 @@ use oauth2::{ClientId,ClientSecret, RedirectUrl, AuthUrl, CsrfToken, PkceCodeCha
 use serde::{Deserialize, Serialize};
 use tokio::time::interval;
 use uuid::Uuid;
+use const_format::concatcp;
+
+use crate::auth_plugins::basic_trait::get_plugin_data;
+
 use super::super::{finalize_login, AppData};
 use super::super::util::{env_var, get_header_string, remove_path_last_part};
-use super::basic_trait::AuthPlugin;
 
 #[derive(Debug)]
 struct AuthorizationSession {
     client: GoogleClient,
     timeout: Instant,
-    source_uri: String,
     pkce_code_verifier: oauth2::PkceCodeVerifier,
     csrf_state: CsrfToken,
 }
 
-pub type AuthStore = Arc<Mutex<HashMap<String, AuthorizationSession>>>;
+type AuthStore = Arc<Mutex<HashMap<String, AuthorizationSession>>>;
 
+use super::basic_trait::{AuthPlugin, PluginContainer};
 #[derive(Clone)]
-pub struct GoogleAuth {
+struct GoogleAuth {
     client_id: ClientId,
     client_secret: ClientSecret,
     keys: Vec<DecodingKey>,
     sessions: AuthStore,
 }
-
+const GOOGLE_AUTH_NAME: &str = "google_auth";
+const GOOGLE_AUTH_PATH: &str = concatcp!("/", GOOGLE_AUTH_NAME);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GoogleExtraTokenFields {
@@ -55,7 +59,7 @@ pub type GoogleClient = oauth2::Client<
 #[derive(Deserialize, Debug)]
 struct GoogleToken {
     sub: String,
-    email: String,
+    // email: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -69,39 +73,19 @@ struct ErrorResponse {
     error: &'static str,
 }
 
-impl super::basic_trait::AuthPlugin for GoogleAuth {
+impl AuthPlugin for GoogleAuth {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     fn get_name(&self) -> String {
-        String::from("google_auth")
+        String::from(GOOGLE_AUTH_NAME)
     }
     
     fn get_actix_scope(&self) -> Scope {
-        web::scope("/google_auth")
+        web::scope(GOOGLE_AUTH_PATH)
             .service(login)
             .service(stage2)
-    }
-}
-
-fn a<'a>(app_data: &AppData) -> Result<(&MutexGuard<dyn AuthPlugin>, &GoogleAuth), std::io::Error> {
-    use std::io::{Error, ErrorKind};
-    let option = app_data.plugins.get("google_auth");
-    
-    match option {
-        Some(arc_mutex_plugin) => {
-            let mutex_plugin= arc_mutex_plugin.lock().map_err(|_| {
-                Error::new(ErrorKind::Other, "Unable to acquire lock on plugin")
-            })?;
-            
-            let plugin = mutex_plugin.as_any().downcast_ref::<GoogleAuth>().ok_or_else(|| {
-                Error::new(ErrorKind::Other, "Failed to downcast plugin to GoogleAuth")
-            })?;
-            
-            Ok((&mutex_plugin, plugin))
-        },
-        None => Err(Error::new(ErrorKind::NotFound, "google_auth plugin not found")),
     }
 }
 
@@ -138,16 +122,13 @@ async fn stage2(
             return HttpResponse::Unauthorized().json(ErrorResponse { error: "No session ID" })
         },
     };
-    let (_guard, plugin) = match a(&app_data) {
-        Ok(value) => value,
-        Err(err) => {
-            error!("failed to get plugin data: {}", err);
-            return HttpResponse::InternalServerError().finish()
-        }
-    };
     let code = AuthorizationCode::new(data.code);
     let state = CsrfToken::new(data.state);
 
+    let plugin = match get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME) {
+        Ok(val) => val,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
     let mut auth_store = plugin.sessions.lock().unwrap();
 
     if let Some(auth_data) = auth_store.remove(&session_id) {
@@ -208,10 +189,9 @@ async fn login(
         }
     };
     debug!("request: {:?}", req);
-    let (_guard, plugin) = match a(&app_data) {
+    let plugin = match get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME) {
         Ok(value) => value,
-        Err(err) => {
-            error!("failed to get plugin data: {}", err);
+        Err(_) => {
             return HttpResponse::InternalServerError().finish()
         }
     };
@@ -240,7 +220,6 @@ async fn login(
         session_id.clone(),
         AuthorizationSession{
             client,
-            source_uri,
             timeout: Instant::now() + Duration::from_secs(1800),
             pkce_code_verifier,
             csrf_state,
@@ -292,7 +271,7 @@ async fn clean_expired_auths(auth_store: AuthStore) {
     }
 }
 
-pub async fn init() -> Result<GoogleAuth, std::io::Error> {
+pub async fn init() -> Result<PluginContainer, std::io::Error> {
     let client_id = ClientId::new(env_var("GOOGLE_CLIENT_ID")?);
     let client_secret = ClientSecret::new(env_var("GOOGLE_CLIENT_SECRET")?);
 
@@ -311,10 +290,10 @@ pub async fn init() -> Result<GoogleAuth, std::io::Error> {
         clean_expired_auths(cleaner_session_auth_store).await;
     });
 
-    Ok(GoogleAuth{
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(GoogleAuth{
         client_id,
         client_secret,
         keys,
         sessions,
-    })
+    })))
 }

@@ -7,9 +7,8 @@ use actix_web::{
 };
 // Alternatively, this can be oauth2::curl::http_client or a custom.
 use oauth2::{ClientSecret, RedirectUrl};
-use reqwest::header::LOCATION;
 use serde::{Serialize, Deserialize};
-use std::{time::{UNIX_EPOCH, SystemTime}, collections::HashMap, sync::Arc};
+use std::{time::{UNIX_EPOCH, SystemTime}, collections::HashMap};
 use actix_web::middleware::Logger;
 use env_logger::Env;
 use std::env;
@@ -28,8 +27,7 @@ type PluginsOne = std::sync::Arc<std::sync::Mutex<dyn auth_plugins::basic_trait:
 type Plugins = HashMap<String, PluginsOne>;
 
 #[derive(Clone)]
-struct AppData {
-    authentication_success_url: String,
+pub struct AppData {
     jwt_secret: ClientSecret,
     plugins: Plugins,
 }
@@ -186,10 +184,10 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(Env::default().default_filter_or("debug"));
 
     let address = env::var("BIND_ADDRESS").unwrap_or("0.0.0.0:8080".to_string());
-    let authentication_success_url = env_var("AUTHENTICATION_SUCCESS_URL").unwrap_or("/".to_string());
     let jwt_secret = ClientSecret::new(env_var("JWT_SECRET")?);
     let plugins_array: Vec<PluginsOne> = vec![
-        Arc::new(std::sync::Mutex::new(auth_plugins::google_auth::init().await?))
+        auth_plugins::example_auth::init()?,
+        auth_plugins::google_auth::init().await?
     ];
     let mut plugins = Plugins::new();
     for item in plugins_array {
@@ -197,7 +195,6 @@ async fn main() -> std::io::Result<()> {
         plugins.insert(item_inner.get_name(), item.clone());
     }
     let app_data = AppData{
-        authentication_success_url,
         jwt_secret,
         plugins,
     };
