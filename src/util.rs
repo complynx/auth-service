@@ -43,3 +43,11 @@ pub fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn
         }
     }
 }
+
+pub fn remove_path_last_part(url_path: String) -> String {
+    let mut parts = url_path.split('/').collect::<Vec<&str>>();
+    if !parts.is_empty() {
+        parts.pop();
+    }
+    parts.join("/")
+}

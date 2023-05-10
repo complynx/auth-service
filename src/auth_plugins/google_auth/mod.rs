@@ -1,18 +1,19 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, Arc};
+use std::sync::{Mutex, Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
 use actix_web::cookie::Cookie;
 use actix_web::http::header;
 use actix_web::{web, get, HttpRequest, HttpResponse, Scope, Responder};
 use jsonwebtoken::{DecodingKey, Validation};
-use log::{debug, info};
+use log::{debug, info, error};
 use oauth2::{ClientId,ClientSecret, RedirectUrl, AuthUrl, CsrfToken, PkceCodeChallenge, TokenUrl, AuthorizationCode};
 use serde::{Deserialize, Serialize};
 use tokio::time::interval;
 use uuid::Uuid;
 use super::super::{finalize_login, AppData};
-use super::super::util::{env_var, get_header_string};
+use super::super::util::{env_var, get_header_string, remove_path_last_part};
+use super::basic_trait::AuthPlugin;
 
 #[derive(Debug)]
 struct AuthorizationSession {
@@ -68,12 +69,48 @@ struct ErrorResponse {
     error: &'static str,
 }
 
-fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken, jsonwebtoken::errors::Error> {
+impl super::basic_trait::AuthPlugin for GoogleAuth {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn get_name(&self) -> String {
+        String::from("google_auth")
+    }
+    
+    fn get_actix_scope(&self) -> Scope {
+        web::scope("/google_auth")
+            .service(login)
+            .service(stage2)
+    }
+}
+
+fn a<'a>(app_data: &AppData) -> Result<(&MutexGuard<dyn AuthPlugin>, &GoogleAuth), std::io::Error> {
+    use std::io::{Error, ErrorKind};
+    let option = app_data.plugins.get("google_auth");
+    
+    match option {
+        Some(arc_mutex_plugin) => {
+            let mutex_plugin= arc_mutex_plugin.lock().map_err(|_| {
+                Error::new(ErrorKind::Other, "Unable to acquire lock on plugin")
+            })?;
+            
+            let plugin = mutex_plugin.as_any().downcast_ref::<GoogleAuth>().ok_or_else(|| {
+                Error::new(ErrorKind::Other, "Failed to downcast plugin to GoogleAuth")
+            })?;
+            
+            Ok((&mutex_plugin, plugin))
+        },
+        None => Err(Error::new(ErrorKind::NotFound, "google_auth plugin not found")),
+    }
+}
+
+fn validate_google_token(plugin: &GoogleAuth, token: &str) -> Result<GoogleToken, jsonwebtoken::errors::Error> {
     let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
-    validation.set_audience(&[&app_data.google_data.client_id.as_str()]);
+    validation.set_audience(&[&plugin.client_id.as_str()]);
     validation.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
 
-    for key in &app_data.google_data.keys {
+    for key in &plugin.keys {
         match jsonwebtoken::decode::<GoogleToken>(token, key, &validation) {
             Ok(decoded_token) => {
                 return Ok(decoded_token.claims);
@@ -93,6 +130,7 @@ async fn stage2(
     web::Query(data): web::Query<CodeResponse>,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
+    debug!("request: {:?}", req);
     let session_id = match get_header_string(&req, "X-Session-Id") {
         Ok(value) => value,
         Err(err) => {
@@ -100,10 +138,17 @@ async fn stage2(
             return HttpResponse::Unauthorized().json(ErrorResponse { error: "No session ID" })
         },
     };
+    let (_guard, plugin) = match a(&app_data) {
+        Ok(value) => value,
+        Err(err) => {
+            error!("failed to get plugin data: {}", err);
+            return HttpResponse::InternalServerError().finish()
+        }
+    };
     let code = AuthorizationCode::new(data.code);
     let state = CsrfToken::new(data.state);
 
-    let mut auth_store = app_data.google_data.sessions.lock().unwrap();
+    let mut auth_store = plugin.sessions.lock().unwrap();
 
     if let Some(auth_data) = auth_store.remove(&session_id) {
         if auth_data.timeout > Instant::now() {
@@ -118,8 +163,11 @@ async fn stage2(
 
             match token_response {
                 Ok(token_response_unwrapped) => {
-                    match validate_google_token(&app_data, token_response_unwrapped.extra_fields().id_token.as_str()) {
-                        Ok(token) => finalize_login(app_data.clone(), req).await,
+                    match validate_google_token(&plugin, token_response_unwrapped.extra_fields().id_token.as_str()) {
+                        Ok(token) => finalize_login(app_data.clone(), req, super::AuthResult{
+                            user: token.sub,
+                            issuer: plugin.get_name()
+                        }).await,
                         Err(err) => {
                             info!("google token validation failed {}", err);
                             HttpResponse::InternalServerError()
@@ -146,28 +194,35 @@ async fn login(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
-    let source_method = get_header_string(&req, "X-Original-Method").unwrap_or("GET".to_string());
-    let source_uri = if source_method == "GET" {
-        get_header_string(&req, "X-Original-URI").unwrap_or(app_data.authentication_success_url.clone())
-    } else {app_data.authentication_success_url.clone()};
-    let redirect_uri = match get_header_string(&req, "X-Redirect-URI") {
-        Ok(value) => match RedirectUrl::new(value) {
-            Ok(value) => value,
-            Err(err) => return HttpResponse::InternalServerError()
-                .body(format!("X-Redirect-URI parse error: {}", err))
-        },
+    let source_uri =match get_header_string(&req, "X-Original-URI") {
+        Ok(value) => value,
         Err(err) => return HttpResponse::InternalServerError()
-            .body(format!("X-Redirect-URI header error: {}", err))
+            .body(format!("X-Original-URI header error: {}", err))
+    };
+    let source_path = remove_path_last_part(source_uri.clone());
+    let redirect_uri = match RedirectUrl::new(format!("{}/stage2",source_path)) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("RedirectUrl parse error: {}", e);
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     debug!("request: {:?}", req);
+    let (_guard, plugin) = match a(&app_data) {
+        Ok(value) => value,
+        Err(err) => {
+            error!("failed to get plugin data: {}", err);
+            return HttpResponse::InternalServerError().finish()
+        }
+    };
 
-    let mut auth_store = app_data.google_data.sessions.lock().unwrap();
+    let mut auth_store = plugin.sessions.lock().unwrap();
 
     let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_string())
         .expect("fix your code");
     let client = GoogleClient::new(
-        app_data.google_data.client_id.clone(),
-        Some(app_data.google_data.client_secret.clone()),
+        plugin.client_id.clone(),
+        Some(plugin.client_secret.clone()),
         auth_url,
         TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).ok(),
     ).set_redirect_uri(redirect_uri);
@@ -191,11 +246,11 @@ async fn login(
             csrf_state,
         });
     
-    HttpResponse::Unauthorized()
+    HttpResponse::Found()
         .append_header((header::LOCATION, authorize_url.to_string()))
         .cookie(
             Cookie::build("google_auth_session_id", session_id.clone())
-                .path("/auth/google_auth")
+                .path(source_path)
                 .secure(true)
                 .max_age(actix_web::cookie::time::Duration::days(1))
                 .finish(),
@@ -262,10 +317,4 @@ pub async fn init() -> Result<GoogleAuth, std::io::Error> {
         keys,
         sessions,
     })
-}
-
-pub fn get_actix_scope() -> Scope {
-    web::scope("/google_auth")
-        .service(login)
-        .service(stage2)
 }

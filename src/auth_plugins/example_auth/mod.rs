@@ -13,5 +13,8 @@ async fn authenticate(
     req: HttpRequest,
 ) -> HttpResponse {
     // some code
-    finalize_login(app_data, req).await
+    finalize_login(app_data, req, super::AuthResult{
+        user: "none".to_string(),
+        issuer: "stub".to_string()
+    }).await
 }
