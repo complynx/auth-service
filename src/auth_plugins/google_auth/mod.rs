@@ -14,9 +14,10 @@ use uuid::Uuid;
 use const_format::concatcp;
 
 use crate::auth_plugins::basic_trait::get_plugin_data;
+use crate::{parse_original_headers, U};
 
 use super::super::{finalize_login, AppData};
-use super::super::util::{env_var, get_header_string, remove_path_last_part};
+use super::super::util::{env_var};
 
 #[derive(Debug)]
 struct AuthorizationSession {
@@ -56,10 +57,11 @@ pub type GoogleClient = oauth2::Client<
     oauth2::basic::BasicRevocationErrorResponse,
 >;
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct GoogleToken {
     sub: String,
-    // email: String,
+    email: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -108,87 +110,25 @@ fn validate_google_token(plugin: &GoogleAuth, token: &str) -> Result<GoogleToken
     Err(jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidToken))
 }
 
-#[get("/stage2")]
-async fn stage2(
-    req: HttpRequest,
-    web::Query(data): web::Query<CodeResponse>,
-    app_data: web::Data<AppData>,
-) -> impl Responder {
-    debug!("request: {:?}", req);
-    let session_id = match get_header_string(&req, "X-Session-Id") {
-        Ok(value) => value,
-        Err(err) => {
-            info!("failed to get X-Session-Id from headers: {}", err);
-            return HttpResponse::Unauthorized().json(ErrorResponse { error: "No session ID" })
-        },
-    };
-    let code = AuthorizationCode::new(data.code);
-    let state = CsrfToken::new(data.state);
-
-    let plugin = match get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME) {
-        Ok(val) => val,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
-    let mut auth_store = plugin.sessions.lock().unwrap();
-
-    if let Some(auth_data) = auth_store.remove(&session_id) {
-        if auth_data.timeout > Instant::now() {
-            if state.secret() != auth_data.csrf_state.secret() {
-                return HttpResponse::Unauthorized().json(ErrorResponse { error: "State mismatch" });
-            }
-            let token_response = auth_data.client
-                .exchange_code(code)
-                .set_pkce_verifier(auth_data.pkce_code_verifier)
-                .request_async(oauth2::reqwest::async_http_client)
-                .await;
-
-            match token_response {
-                Ok(token_response_unwrapped) => {
-                    match validate_google_token(&plugin, token_response_unwrapped.extra_fields().id_token.as_str()) {
-                        Ok(token) => finalize_login(app_data.clone(), req, super::AuthResult{
-                            user: token.sub,
-                            issuer: plugin.get_name()
-                        }).await,
-                        Err(err) => {
-                            info!("google token validation failed {}", err);
-                            HttpResponse::InternalServerError()
-                                .json(ErrorResponse { error: "No email found in the JWT" })
-                        },
-                    }
-                },
-                Err(err) => {
-                    info!("google token fetch failed {}", err);
-                    HttpResponse::Unauthorized()
-                        .json(ErrorResponse { error: "failed to prove token" })
-                },
-            }
-        } else {
-            HttpResponse::Unauthorized().json(ErrorResponse { error: "Session expired" })
-        }
-    } else {
-        HttpResponse::Unauthorized().json(ErrorResponse { error: "No session found" })
-    }
-}
-
 #[get("/login")]
 async fn login(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
-    let source_uri =match get_header_string(&req, "X-Original-URI") {
-        Ok(value) => value,
-        Err(err) => return HttpResponse::InternalServerError()
-            .body(format!("X-Original-URI header error: {}", err))
-    };
-    let source_path = remove_path_last_part(source_uri.clone());
-    let redirect_uri = match RedirectUrl::new(format!("{}/stage2",source_path)) {
+    debug!("request: {:?}", req);
+    let originals = U!(parse_original_headers(&req));
+    let redirect_uri = match RedirectUrl::new(format!(
+        "{}://{}{}/stage2",
+        originals.proto,
+        originals.host,
+        originals.path
+    )) {
         Ok(v) => v,
         Err(e) => {
             error!("RedirectUrl parse error: {}", e);
             return HttpResponse::InternalServerError().finish();
         }
     };
-    debug!("request: {:?}", req);
     let plugin = match get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME) {
         Ok(value) => value,
         Err(_) => {
@@ -229,12 +169,77 @@ async fn login(
         .append_header((header::LOCATION, authorize_url.to_string()))
         .cookie(
             Cookie::build("google_auth_session_id", session_id.clone())
-                .path(source_path)
+                .path(originals.path)
                 .secure(true)
+                .http_only(true)
                 .max_age(actix_web::cookie::time::Duration::days(1))
                 .finish(),
         )
         .finish()
+}
+
+#[get("/stage2")]
+async fn stage2(
+    req: HttpRequest,
+    web::Query(data): web::Query<CodeResponse>,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    debug!("request: {:?}", req);
+    let session_id = match req.cookie("google_auth_session_id") {
+        Some(cookie) => {
+            cookie.value().to_string()
+        }
+        None => {
+            info!("cookie google_auth_session_id not found");
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "No cookie google_auth_session_id" })
+        }
+    };
+    let code = AuthorizationCode::new(data.code);
+    let state = CsrfToken::new(data.state);
+
+    let plugin = match get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME) {
+        Ok(val) => val,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+    let mut auth_store = plugin.sessions.lock().unwrap();
+
+    if let Some(auth_data) = auth_store.remove(session_id.as_str()) {
+        if auth_data.timeout > Instant::now() {
+            if state.secret() != auth_data.csrf_state.secret() {
+                return HttpResponse::Unauthorized().json(ErrorResponse { error: "State mismatch" });
+            }
+            let token_response = auth_data.client
+                .exchange_code(code)
+                .set_pkce_verifier(auth_data.pkce_code_verifier)
+                .request_async(oauth2::reqwest::async_http_client)
+                .await;
+
+            match token_response {
+                Ok(token_response_unwrapped) => {
+                    match validate_google_token(&plugin, token_response_unwrapped.extra_fields().id_token.as_str()) {
+                        Ok(token) => finalize_login(app_data.clone(), req, super::AuthResult{
+                            user: token.sub,
+                            issuer: plugin.get_name()
+                        }).await,
+                        Err(err) => {
+                            info!("google token validation failed {}", err);
+                            HttpResponse::InternalServerError()
+                                .json(ErrorResponse { error: "No email found in the JWT" })
+                        },
+                    }
+                },
+                Err(err) => {
+                    info!("google token fetch failed {}", err);
+                    HttpResponse::Unauthorized()
+                        .json(ErrorResponse { error: "failed to prove token" })
+                },
+            }
+        } else {
+            HttpResponse::Unauthorized().json(ErrorResponse { error: "Session expired" })
+        }
+    } else {
+        HttpResponse::Unauthorized().json(ErrorResponse { error: "No session found" })
+    }
 }
 
 async fn fetch_google_public_keys() -> Result<Vec<DecodingKey>, Box<dyn std::error::Error>> {

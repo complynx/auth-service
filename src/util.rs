@@ -23,6 +23,16 @@ pub fn env_var(key: &str) -> Result<String, std::io::Error> {
     }
 }
 
+#[macro_export]
+macro_rules! U {
+    ($expr:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(err) => return err,
+        }
+    };
+}
+
 
 pub fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
     fn parse(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {

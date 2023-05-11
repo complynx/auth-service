@@ -6,17 +6,25 @@ use actix_web::{
     HttpRequest, cookie::Cookie
 };
 // Alternatively, this can be oauth2::curl::http_client or a custom.
-use oauth2::{ClientSecret, RedirectUrl};
+use oauth2::{ClientSecret};
 use serde::{Serialize, Deserialize};
 use std::{time::{UNIX_EPOCH, SystemTime}, collections::HashMap};
 use actix_web::middleware::Logger;
 use env_logger::Env;
 use std::env;
 use jsonwebtoken::{decode, Validation};
-use log::{debug, info, error};
+use log::{debug, info};
 use util::{env_var, remove_path_last_part};
 
 use crate::util::get_header_string;
+
+const SESSION_COOKIE_NAME: &str = "session_id";
+const SESSION_COOKIE_HEADER: &str = "X-Session-Id";
+
+const ORIGINAL_URI_HEADER: &str = "X-Original-URI";
+const ORIGINAL_METHOD_HEADER: &str = "X-Original-Method";
+const ORIGINAL_HOST_HEADER: &str = "Host";
+const ORIGINAL_PROTO_HEADER: &str = "X-Forwarded-Proto";
 
 #[derive(Serialize, Debug)]
 struct LoginResponse {
@@ -38,6 +46,22 @@ struct AuthToken{
     exp: u64,
 }
 
+#[derive(Serialize, Debug)]
+struct ErrorResponse {
+    error: String,
+}
+
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub struct Originals {
+    uri: String,
+    path: String,
+    method: String,
+    host: String,
+    proto: String,
+}
+
 fn create_token_cookie<'c>(app_data: web::Data<AppData>, mut token: AuthToken) -> Cookie<'c> {
     let expiration_seconds = 3600;
     let exp = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -51,11 +75,31 @@ fn create_token_cookie<'c>(app_data: web::Data<AppData>, mut token: AuthToken) -
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     let auth_token = jsonwebtoken::encode(&header, &token, &secret).unwrap();
 
-    return Cookie::build("session_id", auth_token)
+    return Cookie::build(SESSION_COOKIE_NAME, auth_token)
         .path("/")
         .secure(true)
+        .http_only(true)
         .max_age(actix_web::cookie::time::Duration::seconds(expiration_seconds.try_into().unwrap()))
         .finish();
+}
+
+fn parse_original_headers(req: &HttpRequest) -> Result<Originals, HttpResponse> {
+    fn h(req: &HttpRequest, s: &str) -> Result<String, HttpResponse> {
+        get_header_string(req, s)
+            .map_err(|err| HttpResponse::InternalServerError().body(format!("{} header error: {}", s, err)))
+    }
+    let uri = h(req, ORIGINAL_URI_HEADER)?;
+    let method = h(req, ORIGINAL_METHOD_HEADER)?;
+    let proto = h(req, ORIGINAL_PROTO_HEADER)?;
+    let host = h(req, ORIGINAL_HOST_HEADER)?;
+    let path = remove_path_last_part(uri.clone());
+    Ok(Originals {
+        uri,
+        path,
+        method,
+        host,
+        proto,
+    })
 }
 
 async fn finalize_login(
@@ -85,54 +129,20 @@ async fn healthcheck() -> impl Responder {
     HttpResponse::Ok().finish()
 }
 
-#[derive(Serialize, Debug)]
-struct ErrorResponse {
-    error: &'static str,
-}
-#[get("/keep-alive")]
-async fn keep_alive(
-    req: HttpRequest,
-    app_data: web::Data<AppData>,
-) -> impl Responder {
-    let session_id = match get_header_string(&req, "X-Session-Id") {
-        Ok(value) => value,
-        Err(err) => {
-            info!("failed to get X-Session-Id from headers: {}", err);
-            return HttpResponse::Unauthorized().json(ErrorResponse { error: "no session found to keep alive" })
-        },
-    };
-
-    match auth_token_validate(&session_id, &app_data) {
-        Ok(token) => {
-            HttpResponse::Ok()
-                .cookie(create_token_cookie(app_data, token))
-                .finish()
-        },
-        Err(err) =>{
-            info!("token validation failed: {}", err);
-            HttpResponse::Unauthorized().json(ErrorResponse { error: "no session found to keep alive" })
-        }
-    }
-}
-
 #[get("/login")]
 async fn login(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
+    debug!("request: {:?}", req);
     let mut html = String::from("<html><head><title>Login</title></head><body><h1>Login</h1><ul>");
-    let source_uri =match get_header_string(&req, "X-Original-URI") {
-        Ok(value) => value,
-        Err(err) => return HttpResponse::InternalServerError()
-            .body(format!("X-Original-URI header error: {}", err))
-    };
-    let source_path = remove_path_last_part(source_uri.clone());
+    let originals = U!(parse_original_headers(&req));
 
     for plugin_name in app_data.plugins.keys() {
         html.push_str(&format!(
             r#"<li><a href="{source_path}/{plugin_name}/login">{plugin_name}</a></li>"#,
             plugin_name = plugin_name,
-            source_path = source_path
+            source_path = originals.path
         ));
     }
 
@@ -141,27 +151,63 @@ async fn login(
     HttpResponse::Ok().content_type("text/html").body(html)
 }
 
+#[get("/login_json")]
+async fn login_json(
+    req: HttpRequest,
+    app_data: web::Data<AppData>
+) -> HttpResponse {
+    debug!("request: {:?}", req);
+    let originals = U!(parse_original_headers(&req));
+
+    let mut plugins: HashMap<String, String> = HashMap::new();
+
+    for plugin_name in app_data.plugins.keys() {
+        plugins.insert(
+            plugin_name.clone(),
+            format!("{}/{}", originals.path, plugin_name),
+        );
+    }
+
+    HttpResponse::Ok().content_type("application/json").json(plugins)
+}
+
 async fn forward_to_login(
     req: HttpRequest,
     _app_data: web::Data<AppData>,
+    err: String,
 ) -> HttpResponse {
-    let source_uri =match get_header_string(&req, "X-Original-URI") {
-        Ok(value) => value,
-        Err(err) => return HttpResponse::InternalServerError()
-            .body(format!("X-Original-URI header error: {}", err))
-    };
-    let source_path = remove_path_last_part(source_uri.clone());
-    let redirect_uri = match RedirectUrl::new(format!("{}/login",source_path)) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("RedirectUrl parse error: {}", e);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
+    let originals = U!(parse_original_headers(&req));
 
     HttpResponse::Unauthorized()
-        .append_header((actix_web::http::header::LOCATION, redirect_uri.to_string()))
-        .finish()
+        .append_header((actix_web::http::header::LOCATION, format!("{}/login", originals.path)))
+        .json(ErrorResponse { error: err })
+}
+
+async fn check_session_and_keep(
+    do_keep_alive: bool,
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    let session_id = match get_header_string(&req, SESSION_COOKIE_HEADER) {
+        Ok(value) => value,
+        Err(_) => {
+            return forward_to_login(req, app_data, "no session found".to_string()).await
+        },
+    };
+
+    match auth_token_validate(&session_id, &app_data) {
+        Ok(token) => {
+            let mut builder = HttpResponse::Ok();
+            if do_keep_alive {
+                builder.cookie(create_token_cookie(app_data, token));
+            }
+            builder.finish()
+        },
+        Err(err) =>{
+            info!("token validation failed: {}", err);
+            forward_to_login(req, app_data.clone(), "session is not valid".to_string()).await
+        }
+    }
 }
 
 #[get("/check")]
@@ -169,21 +215,17 @@ async fn check_session(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
-    let session_id = match get_header_string(&req, "X-Session-Id") {
-        Ok(value) => value,
-        Err(err) => {
-            info!("failed to get X-Session-Id from headers: {}", err);
-            return forward_to_login(req, app_data).await
-        },
-    };
+    debug!("request: {:?}", req);
+    check_session_and_keep(false, req, app_data).await
+}
 
-    match auth_token_validate(&session_id, &app_data) {
-        Ok(_) => HttpResponse::Ok().finish(),
-        Err(err) =>{
-            info!("token validation failed: {}", err);
-            forward_to_login(req, app_data.clone()).await
-        }
-    }
+#[get("/keep-alive")]
+async fn keep_alive(
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    debug!("request: {:?}", req);
+    check_session_and_keep(true, req, app_data).await
 }
 
 #[actix_web::main]
@@ -216,6 +258,8 @@ async fn main() -> std::io::Result<()> {
                 web::scope("/auth")
                     .service(check_session)
                     .service(keep_alive)
+                    .service(login)
+                    .service(login_json)
                     .configure(|cfg| {
                         for item in app_data.plugins.values() {
                             cfg.service(item.lock().unwrap().get_actix_scope());
