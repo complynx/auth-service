@@ -1,134 +1,68 @@
+mod auth_plugins;
+mod util;
+
 use actix_web::{
     get, web, App, HttpServer, Responder, HttpResponse,
-    HttpRequest, cookie::Cookie, cookie::time::Duration as CDuration,
-    http::header
+    HttpRequest, cookie::Cookie
 };
 // Alternatively, this can be oauth2::curl::http_client or a custom.
-use oauth2::reqwest::async_http_client;
-use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    RedirectUrl, Scope, TokenUrl,
-};
+use oauth2::{ClientSecret};
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH, SystemTime};
-use uuid::Uuid;
+use std::{time::{UNIX_EPOCH, SystemTime}, collections::HashMap};
 use actix_web::middleware::Logger;
 use env_logger::Env;
-use tokio::time::interval;
 use std::env;
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::{decode, Validation};
 use log::{debug, info};
+use util::{env_var, remove_path_last_part};
+
+use crate::util::get_header_string;
+
+const SESSION_COOKIE_NAME: &str = "session_id";
+const SESSION_COOKIE_HEADER: &str = "X-Session-Id";
+
+const ORIGINAL_URI_HEADER: &str = "X-Original-URI";
+const ORIGINAL_METHOD_HEADER: &str = "X-Original-Method";
+const ORIGINAL_HOST_HEADER: &str = "Host";
+const ORIGINAL_PROTO_HEADER: &str = "X-Forwarded-Proto";
 
 #[derive(Serialize, Debug)]
 struct LoginResponse {
     session_id: String,
 }
 
-#[derive(Serialize, Debug)]
-struct ErrorResponse {
-    error: &'static str,
-}
-
-#[derive(Deserialize, Debug)]
-struct CodeResponse {
-    code: String,
-    state: String
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct GoogleExtraTokenFields {
-    pub id_token: String,
-}
-
-impl oauth2::ExtraTokenFields for GoogleExtraTokenFields {}
-
-pub type GoogleTokenResponse = oauth2::StandardTokenResponse<GoogleExtraTokenFields, oauth2::basic::BasicTokenType>;
-pub type GoogleClient = oauth2::Client<
-    oauth2::basic::BasicErrorResponse,
-    GoogleTokenResponse,
-    oauth2::basic::BasicTokenType,
-    oauth2::basic::BasicTokenIntrospectionResponse,
-    oauth2::StandardRevocableToken,
-    oauth2::basic::BasicRevocationErrorResponse,
->;
-
-#[derive(Debug)]
-struct AuthorizationSession {
-    client: GoogleClient,
-    timeout: Instant,
-    source_uri: String,
-    pkce_code_verifier: oauth2::PkceCodeVerifier,
-    csrf_state: CsrfToken,
-}
-
-type AuthStore = Arc<Mutex<HashMap<String, AuthorizationSession>>>;
+type PluginsOne = std::sync::Arc<std::sync::Mutex<dyn auth_plugins::basic_trait::AuthPlugin>>;
+type Plugins = HashMap<String, PluginsOne>;
 
 #[derive(Clone)]
-struct AppData {
-    session_auth_store: AuthStore,
-    google_client_id: ClientId,
-    google_client_secret: ClientSecret,
-    authentication_success_url: String,
-    google_keys: Vec<DecodingKey>,
+pub struct AppData {
     jwt_secret: ClientSecret,
-}
-
-
-#[derive(Deserialize, Debug)]
-struct GoogleToken {
-    sub: String,
-    email: String,
+    plugins: Plugins,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct AuthToken{
     sub: String,
     exp: u64,
-    email: String,
 }
 
-fn get_header_string(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
-    fn parse(req: &HttpRequest, key: &str) -> Result<String, Box<dyn std::error::Error>> {
-        let ret = req.headers()
-            .get(key)
-            .ok_or(format!("Header {} not found", key))?
-            .to_str()?;
-        Ok(ret.to_string())
-    }
-    match parse(req, key) {
-        Ok(s) => {
-            debug!("got header {}: {}", key, s);
-            Ok(s)
-        },
-        Err(e) => {
-            debug!("failed to get header {}: {}", key, e);
-            Err(e)
-        }
-    }
+#[derive(Serialize, Debug)]
+struct ErrorResponse {
+    error: String,
 }
 
-fn validate_google_token(app_data: &AppData, token: &str) -> Result<GoogleToken, jsonwebtoken::errors::Error> {
-    let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256);
-    validation.set_audience(&[&app_data.google_client_id.as_str()]);
-    validation.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
 
-    for key in &app_data.google_keys {
-        match decode::<GoogleToken>(token, key, &validation) {
-            Ok(decoded_token) => {
-                return Ok(decoded_token.claims);
-            },
-            Err(err) => {
-                debug!("decode token failed: {} ({:?})", err, err.kind());
-            }
-        }
-    }
-
-    Err(jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidToken))
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub struct Originals {
+    uri: String,
+    path: String,
+    method: String,
+    host: String,
+    proto: String,
 }
 
-fn create_token_cookie(app_data: &AppData, mut token: AuthToken) -> Cookie {
+fn create_token_cookie<'c>(app_data: web::Data<AppData>, mut token: AuthToken) -> Cookie<'c> {
     let expiration_seconds = 3600;
     let exp = SystemTime::now().duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
@@ -141,139 +75,46 @@ fn create_token_cookie(app_data: &AppData, mut token: AuthToken) -> Cookie {
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     let auth_token = jsonwebtoken::encode(&header, &token, &secret).unwrap();
 
-    return Cookie::build("session_id", auth_token)
+    return Cookie::build(SESSION_COOKIE_NAME, auth_token)
         .path("/")
         .secure(true)
-        .max_age(CDuration::seconds(expiration_seconds.try_into().unwrap()))
+        .http_only(true)
+        .max_age(actix_web::cookie::time::Duration::seconds(expiration_seconds.try_into().unwrap()))
         .finish();
 }
 
-fn finish_login(app_data: &AppData, source_uri: String, token: GoogleToken) -> HttpResponse {
-    debug!("google token: {:?}", token);
+fn parse_original_headers(req: &HttpRequest) -> Result<Originals, HttpResponse> {
+    fn h(req: &HttpRequest, s: &str) -> Result<String, HttpResponse> {
+        get_header_string(req, s)
+            .map_err(|err| HttpResponse::InternalServerError().body(format!("{} header error: {}", s, err)))
+    }
+    let uri = h(req, ORIGINAL_URI_HEADER)?;
+    let method = h(req, ORIGINAL_METHOD_HEADER)?;
+    let proto = h(req, ORIGINAL_PROTO_HEADER)?;
+    let host = h(req, ORIGINAL_HOST_HEADER)?;
+    let path = remove_path_last_part(uri.clone());
+    Ok(Originals {
+        uri,
+        path,
+        method,
+        host,
+        proto,
+    })
+}
+
+async fn finalize_login(
+    app_data: web::Data<AppData>,
+    _req: HttpRequest,
+    auth_result: auth_plugins::AuthResult,
+) -> HttpResponse {
+    debug!("result: {:?}", auth_result);
     let claims = AuthToken {
-        sub: token.sub.clone(),
-        email: token.email.clone(),
+        sub: format!("{}:{}", auth_result.issuer, auth_result.user),
         exp: 0,
     };
 
-    HttpResponse::Found()
+    HttpResponse::Ok()
         .cookie(create_token_cookie(app_data, claims))
-        .append_header((header::LOCATION, source_uri))
-        .finish()
-}
-
-#[get("/auth/login")]
-async fn login(
-    req: HttpRequest,
-    web::Query(data): web::Query<CodeResponse>,
-    app_data: web::Data<AppData>,
-) -> impl Responder {
-    let session_id = match get_header_string(&req, "X-Session-Id") {
-        Ok(value) => value,
-        Err(err) => {
-            info!("failed to get X-Session-Id from headers: {}", err);
-            return HttpResponse::Unauthorized().json(ErrorResponse { error: "No session ID" })
-        },
-    };
-    let code = AuthorizationCode::new(data.code);
-    let state = CsrfToken::new(data.state);
-
-    let mut auth_store = app_data.session_auth_store.lock().unwrap();
-
-    if let Some(auth_data) = auth_store.remove(&session_id) {
-        if auth_data.timeout > Instant::now() {
-            if state.secret() != auth_data.csrf_state.secret() {
-                return HttpResponse::Unauthorized().json(ErrorResponse { error: "State mismatch" });
-            }
-            let token_response = auth_data.client
-                .exchange_code(code)
-                .set_pkce_verifier(auth_data.pkce_code_verifier)
-                .request_async(async_http_client)
-                .await;
-
-            match token_response {
-                Ok(token_response_unwrapped) => {
-                    match validate_google_token(&app_data, token_response_unwrapped.extra_fields().id_token.as_str()) {
-                        Ok(token) => finish_login(&app_data, auth_data.source_uri, token),
-                        Err(err) => {
-                            info!("google token validation failed {}", err);
-                            HttpResponse::InternalServerError()
-                                .json(ErrorResponse { error: "No email found in the JWT" })
-                        },
-                    }
-                },
-                Err(err) => {
-                    info!("google token fetch failed {}", err);
-                    HttpResponse::Unauthorized()
-                        .json(ErrorResponse { error: "failed to prove token" })
-                },
-            }
-        } else {
-            HttpResponse::Unauthorized().json(ErrorResponse { error: "Session expired" })
-        }
-    } else {
-        HttpResponse::Unauthorized().json(ErrorResponse { error: "No session found" })
-    }
-}
-
-async fn start_login(
-    req: HttpRequest,
-    app_data: web::Data<AppData>,
-) -> HttpResponse {
-    let source_method = get_header_string(&req, "X-Original-Method").unwrap_or("GET".to_string());
-    let source_uri = if source_method == "GET" {
-        get_header_string(&req, "X-Original-URI").unwrap_or(app_data.authentication_success_url.clone())
-    } else {app_data.authentication_success_url.clone()};
-    let redirect_uri = match get_header_string(&req, "X-Redirect-URI") {
-        Ok(value) => match RedirectUrl::new(value) {
-            Ok(value) => value,
-            Err(err) => return HttpResponse::InternalServerError()
-                .body(format!("X-Redirect-URI parse error: {}", err))
-        },
-        Err(err) => return HttpResponse::InternalServerError()
-            .body(format!("X-Redirect-URI header error: {}", err))
-    };
-    debug!("request: {:?}", req);
-
-    let mut auth_store = app_data.session_auth_store.lock().unwrap();
-
-    let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_string())
-        .expect("fix your code");
-    let client = GoogleClient::new(
-        app_data.google_client_id.clone(),
-        Some(app_data.google_client_secret.clone()),
-        auth_url,
-        TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).ok(),
-    ).set_redirect_uri(redirect_uri);
-    let (pkce_code_challenge, pkce_code_verifier) = PkceCodeChallenge::new_random_sha256();
-
-    let (authorize_url, csrf_state) = client
-        .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new("https://www.googleapis.com/auth/userinfo.email".to_string()))
-        .add_scope(Scope::new("openid".to_string()))
-        .set_pkce_challenge(pkce_code_challenge)
-        .url();
-    
-    let session_id = Uuid::new_v4().to_string();
-    auth_store.insert(
-        session_id.clone(),
-        AuthorizationSession{
-            client,
-            source_uri,
-            timeout: Instant::now() + Duration::from_secs(1800),
-            pkce_code_verifier,
-            csrf_state,
-        });
-    
-    HttpResponse::Unauthorized()
-        .append_header((header::LOCATION, authorize_url.to_string()))
-        .cookie(
-            Cookie::build("session_id", session_id.clone())
-                .path("/")
-                .secure(true)
-                .max_age(CDuration::days(1))
-                .finish(),
-        )
         .finish()
 }
 
@@ -283,108 +124,108 @@ fn auth_token_validate(token: &str, app_data: &AppData) -> Result<AuthToken, jso
     Ok(decode::<AuthToken>(&token, &secret, &validation)?.claims)
 }
 
-#[get("/auth/keep-alive")]
-async fn keep_alive(
+#[get("/healthcheck")]
+async fn healthcheck() -> impl Responder {
+    HttpResponse::Ok().finish()
+}
+
+#[get("/login")]
+async fn login(
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> HttpResponse {
+    debug!("request: {:?}", req);
+    let mut html = String::from("<html><head><title>Login</title></head><body><h1>Login</h1><ul>");
+    let originals = U!(parse_original_headers(&req));
+
+    for plugin_name in app_data.plugins.keys() {
+        html.push_str(&format!(
+            r#"<li><a href="{source_path}/{plugin_name}/login">{plugin_name}</a></li>"#,
+            plugin_name = plugin_name,
+            source_path = originals.path
+        ));
+    }
+
+    html.push_str("</ul></body></html>");
+
+    HttpResponse::Ok().content_type("text/html").body(html)
+}
+
+#[get("/login_json")]
+async fn login_json(
+    req: HttpRequest,
+    app_data: web::Data<AppData>
+) -> HttpResponse {
+    debug!("request: {:?}", req);
+    let originals = U!(parse_original_headers(&req));
+
+    let mut plugins: HashMap<String, String> = HashMap::new();
+
+    for plugin_name in app_data.plugins.keys() {
+        plugins.insert(
+            plugin_name.clone(),
+            format!("{}/{}", originals.path, plugin_name),
+        );
+    }
+
+    HttpResponse::Ok().content_type("application/json").json(plugins)
+}
+
+async fn forward_to_login(
+    req: HttpRequest,
+    _app_data: web::Data<AppData>,
+    err: String,
+) -> HttpResponse {
+    let originals = U!(parse_original_headers(&req));
+
+    HttpResponse::Unauthorized()
+        .append_header((actix_web::http::header::LOCATION, format!("{}/login", originals.path)))
+        .json(ErrorResponse { error: err })
+}
+
+async fn check_session_and_keep(
+    do_keep_alive: bool,
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
-    let session_id = match get_header_string(&req, "X-Session-Id") {
+    let session_id = match get_header_string(&req, SESSION_COOKIE_HEADER) {
         Ok(value) => value,
-        Err(err) => {
-            info!("failed to get X-Session-Id from headers: {}", err);
-            return HttpResponse::Unauthorized().json(ErrorResponse { error: "no session found to keep alive" })
+        Err(_) => {
+            return forward_to_login(req, app_data, "no session found".to_string()).await
         },
     };
 
     match auth_token_validate(&session_id, &app_data) {
         Ok(token) => {
-            HttpResponse::Ok()
-                .cookie(create_token_cookie(&app_data, token))
-                .finish()
+            let mut builder = HttpResponse::Ok();
+            if do_keep_alive {
+                builder.cookie(create_token_cookie(app_data, token));
+            }
+            builder.finish()
         },
         Err(err) =>{
             info!("token validation failed: {}", err);
-            HttpResponse::Unauthorized().json(ErrorResponse { error: "no session found to keep alive" })
+            forward_to_login(req, app_data.clone(), "session is not valid".to_string()).await
         }
     }
 }
 
-#[get("/auth/check")]
+#[get("/check")]
 async fn check_session(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
-    let session_id = match get_header_string(&req, "X-Session-Id") {
-        Ok(value) => value,
-        Err(err) => {
-            info!("failed to get X-Session-Id from headers: {}", err);
-            return start_login(req, app_data).await
-        },
-    };
-
-    match auth_token_validate(&session_id, &app_data) {
-        Ok(_) => HttpResponse::Ok().finish(),
-        Err(err) =>{
-            info!("token validation failed: {}", err);
-            start_login(req, app_data.clone()).await
-        }
-    }
+    debug!("request: {:?}", req);
+    check_session_and_keep(false, req, app_data).await
 }
 
-async fn clean_expired_auths(auth_store: AuthStore) {
-    let mut interval = interval(Duration::from_secs(600));
-    loop {
-        interval.tick().await;
-        debug!("Cleaning expired auths");
-        let mut store = auth_store.lock().unwrap();
-        store.retain(|_, session| session.timeout > Instant::now());
-    }
-}
-
-async fn fetch_google_public_keys() -> Result<Vec<DecodingKey>, Box<dyn std::error::Error>> {
-    const URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
-
-    let response: serde_json::Value = reqwest::get(URL).await?.json().await?;
-
-    let keys = response["keys"].as_array().ok_or("failed to convert keys to array")?;
-
-    let mut decoded_keys = Vec::new();
-
-    for key in keys {
-        let n = key["n"]
-            .as_str()
-            .ok_or("Failed to convert n to string")?;
-        let e = key["e"]
-            .as_str()
-            .ok_or("Failed to convert e to string")?;
-
-        let decoding_key = DecodingKey::from_rsa_components(n,e)?;
-        decoded_keys.push(decoding_key);
-    }
-    
-    Ok(decoded_keys)
-}
-
-fn env_var(key: &str) -> Result<String, std::io::Error> {
-    let ret = env::var(key).map_err(
-        |err| std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Missing the {} environment variable: {}", key, err)
-        )
-    );
-    match ret {
-        Ok(s) => {
-            if s == "" {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Environment variable {} is empty.", key)
-                ));
-            } else {
-                return Ok(s);
-            }
-        },
-        Err(e) => Err(e)
-    }
+#[get("/keep-alive")]
+async fn keep_alive(
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    debug!("request: {:?}", req);
+    check_session_and_keep(true, req, app_data).await
 }
 
 #[actix_web::main]
@@ -392,42 +233,40 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(Env::default().default_filter_or("debug"));
 
     let address = env::var("BIND_ADDRESS").unwrap_or("0.0.0.0:8080".to_string());
-    let google_client_id = ClientId::new(env_var("GOOGLE_CLIENT_ID")?);
-    let google_client_secret = ClientSecret::new(env_var("GOOGLE_CLIENT_SECRET")?);
-    let authentication_success_url = env_var("AUTHENTICATION_SUCCESS_URL").unwrap_or("/".to_string());
     let jwt_secret = ClientSecret::new(env_var("JWT_SECRET")?);
-    let google_keys = fetch_google_public_keys()
-        .await
-        .map_err(
-            |err| std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Couldn't fetch google public keys: {}", err)
-            )
-        )?;
-
-    let session_auth_store: AuthStore = Arc::new(Mutex::new(HashMap::new()));
+    let plugins_array: Vec<PluginsOne> = vec![
+        auth_plugins::example_auth::init()?,
+        auth_plugins::google_auth::init().await?
+    ];
+    let mut plugins = Plugins::new();
+    for item in plugins_array {
+        let item_inner = item.lock().unwrap();
+        plugins.insert(item_inner.get_name(), item.clone());
+    }
     let app_data = AppData{
-        session_auth_store,
-        google_client_id,
-        google_client_secret,
-        authentication_success_url,
-        google_keys,
         jwt_secret,
+        plugins,
     };
-
-    let cleaner_session_auth_store = app_data.session_auth_store.clone();
-    tokio::spawn(async move {
-        clean_expired_auths(cleaner_session_auth_store).await;
-    });
+    
 
     HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
             .wrap(Logger::new("%a %{User-Agent}i"))
             .app_data(web::Data::new(app_data.clone()))
-            .service(check_session)
-            .service(login)
-            .service(keep_alive)
+            .service(
+                web::scope("/auth")
+                    .service(check_session)
+                    .service(keep_alive)
+                    .service(login)
+                    .service(login_json)
+                    .configure(|cfg| {
+                        for item in app_data.plugins.values() {
+                            cfg.service(item.lock().unwrap().get_actix_scope());
+                        }
+                    })
+            )
+            .service(healthcheck)
     })
     .bind(address)?
     .run()
