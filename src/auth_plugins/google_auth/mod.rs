@@ -14,7 +14,7 @@ use uuid::Uuid;
 use const_format::concatcp;
 
 use crate::auth_plugins::basic_trait::get_plugin_data;
-use crate::{parse_original_headers, U};
+use crate::{parse_forwarded_headers, U};
 
 use super::super::{finalize_login, AppData};
 use super::super::util::{env_var};
@@ -116,12 +116,12 @@ async fn login(
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
     debug!("request: {:?}", req);
-    let originals = U!(parse_original_headers(&req));
+    let forwarded = U!(parse_forwarded_headers(&req));
     let redirect_uri = match RedirectUrl::new(format!(
         "{}://{}{}/stage2",
-        originals.proto,
-        originals.host,
-        originals.path
+        forwarded.proto,
+        forwarded.host,
+        forwarded.path
     )) {
         Ok(v) => v,
         Err(e) => {
@@ -169,7 +169,7 @@ async fn login(
         .append_header((header::LOCATION, authorize_url.to_string()))
         .cookie(
             Cookie::build("google_auth_session_id", session_id.clone())
-                .path(originals.path)
+                .path(forwarded.path)
                 .secure(true)
                 .http_only(true)
                 .max_age(actix_web::cookie::time::Duration::days(1))

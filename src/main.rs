@@ -21,10 +21,12 @@ use crate::util::get_header_string;
 const SESSION_COOKIE_NAME: &str = "session_id";
 const SESSION_COOKIE_HEADER: &str = "X-Session-Id";
 
+const FORWARDED_URI_HEADER: &str = "X-Forwarded-URI";
+const FORWARDED_HOST_HEADER: &str = "Host";
+const FORWARDED_PROTO_HEADER: &str = "X-Forwarded-Proto";
+
 const ORIGINAL_URI_HEADER: &str = "X-Original-URI";
 const ORIGINAL_METHOD_HEADER: &str = "X-Original-Method";
-const ORIGINAL_HOST_HEADER: &str = "Host";
-const ORIGINAL_PROTO_HEADER: &str = "X-Forwarded-Proto";
 
 #[derive(Serialize, Debug)]
 struct LoginResponse {
@@ -54,12 +56,17 @@ struct ErrorResponse {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
-pub struct Originals {
+pub struct Forwarded {
     uri: String,
     path: String,
-    method: String,
     host: String,
     proto: String,
+}
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub struct Original {
+    uri: String,
+    method: String,
 }
 
 fn create_token_cookie<'c>(app_data: web::Data<AppData>, mut token: AuthToken) -> Cookie<'c> {
@@ -83,23 +90,30 @@ fn create_token_cookie<'c>(app_data: web::Data<AppData>, mut token: AuthToken) -
         .finish();
 }
 
-fn parse_original_headers(req: &HttpRequest) -> Result<Originals, HttpResponse> {
+fn parse_forwarded_headers(req: &HttpRequest) -> Result<Forwarded, HttpResponse> {
     fn h(req: &HttpRequest, s: &str) -> Result<String, HttpResponse> {
         get_header_string(req, s)
             .map_err(|err| HttpResponse::InternalServerError().body(format!("{} header error: {}", s, err)))
     }
-    let uri = h(req, ORIGINAL_URI_HEADER)?;
-    let method = h(req, ORIGINAL_METHOD_HEADER)?;
-    let proto = h(req, ORIGINAL_PROTO_HEADER)?;
-    let host = h(req, ORIGINAL_HOST_HEADER)?;
+    let uri = h(req, FORWARDED_URI_HEADER)?;
+    let proto = h(req, FORWARDED_PROTO_HEADER)?;
+    let host = h(req, FORWARDED_HOST_HEADER)?;
     let path = remove_path_last_part(uri.clone());
-    Ok(Originals {
+    Ok(Forwarded {
         uri,
         path,
-        method,
         host,
         proto,
     })
+}
+
+fn parse_original_headers(req: &HttpRequest, forwarded: &Forwarded) -> Original {
+    let uri = get_header_string(req, ORIGINAL_URI_HEADER).unwrap_or(forwarded.uri.clone());
+    let method = get_header_string(req, ORIGINAL_METHOD_HEADER).unwrap_or("GET".to_string());
+    Original {
+        uri,
+        method,
+    }
 }
 
 async fn finalize_login(
@@ -136,13 +150,13 @@ async fn login(
 ) -> HttpResponse {
     debug!("request: {:?}", req);
     let mut html = String::from("<html><head><title>Login</title></head><body><h1>Login</h1><ul>");
-    let originals = U!(parse_original_headers(&req));
+    let forwarded = U!(parse_forwarded_headers(&req));
 
     for plugin_name in app_data.plugins.keys() {
         html.push_str(&format!(
             r#"<li><a href="{source_path}/{plugin_name}/login">{plugin_name}</a></li>"#,
             plugin_name = plugin_name,
-            source_path = originals.path
+            source_path = forwarded.path
         ));
     }
 
@@ -157,14 +171,14 @@ async fn login_json(
     app_data: web::Data<AppData>
 ) -> HttpResponse {
     debug!("request: {:?}", req);
-    let originals = U!(parse_original_headers(&req));
+    let forwarded = U!(parse_forwarded_headers(&req));
 
     let mut plugins: HashMap<String, String> = HashMap::new();
 
     for plugin_name in app_data.plugins.keys() {
         plugins.insert(
             plugin_name.clone(),
-            format!("{}/{}", originals.path, plugin_name),
+            format!("{}/{}", forwarded.path, plugin_name),
         );
     }
 
@@ -176,10 +190,11 @@ async fn forward_to_login(
     _app_data: web::Data<AppData>,
     err: String,
 ) -> HttpResponse {
-    let originals = U!(parse_original_headers(&req));
+    let forwarded = U!(parse_forwarded_headers(&req));
+    let _originals = parse_original_headers(&req, &forwarded);
 
     HttpResponse::Unauthorized()
-        .append_header((actix_web::http::header::LOCATION, format!("{}/login", originals.path)))
+        .append_header((actix_web::http::header::LOCATION, format!("{}/login", forwarded.path)))
         .json(ErrorResponse { error: err })
 }
 
