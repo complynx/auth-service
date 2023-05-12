@@ -165,7 +165,7 @@ async fn login(
             csrf_state,
         });
     
-    HttpResponse::Found()
+    HttpResponse::SeeOther()
         .append_header((header::LOCATION, authorize_url.to_string()))
         .cookie(
             Cookie::build("google_auth_session_id", session_id.clone())
