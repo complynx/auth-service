@@ -22,7 +22,7 @@ impl AuthPlugin for ExampleAuth {
         String::from(EXAMPLE_AUTH_NAME)
     }
 
-    fn get_login_page(&self) -> String {
+    fn get_login_page(&self, _path: &String) -> String {
         String::from(EXAMPLE_LOGIN_PAGE)
     }
     

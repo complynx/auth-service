@@ -1,22 +1,40 @@
+
 use actix_web::{web, get, HttpRequest, HttpResponse, Scope};
 use const_format::concatcp;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use crate::util::env_var;
 use crate::{parse_forwarded_headers, U};
 use crate::auth_plugins::basic_trait::get_plugin_data;
-
 use super::super::{finalize_login, AppData};
-
 use super::basic_trait::{AuthPlugin, PluginContainer, flag};
+
+const TELEGRAM_AUTH_NAME: &str = "telegram";
+const TELEGRAM_AUTH_PATH: &str = concatcp!("/", TELEGRAM_AUTH_NAME);
+const TELEGRAM_LOGIN_PAGE: &str = "login";
+const MAX_AUTH_RECEIVE_DURATION: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 #[derive(Clone)]
 struct TelegramAuth {
     bot_name: String,
     bot_token: String,
     login_page_override: Option<String>,
 }
-const TELEGRAM_AUTH_NAME: &str = "telegram";
-const TELEGRAM_AUTH_PATH: &str = concatcp!("/", TELEGRAM_AUTH_NAME);
-const TELEGRAM_LOGIN_PAGE: &str = "login";
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct TelegramLoginResponse {
+    id: String,
+    first_name: String,
+    last_name: String,
+    username: String,
+    photo_url: String,
+    auth_date: String,
+    hash: String,
+}
+
+#[derive(Serialize, Debug)]
+struct ErrorResponse {
+    error: &'static str,
+}
 
 impl AuthPlugin for TelegramAuth {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -27,9 +45,9 @@ impl AuthPlugin for TelegramAuth {
         String::from(TELEGRAM_AUTH_NAME)
     }
 
-    fn get_login_page(&self) -> String {
+    fn get_login_page(&self, path: &String) -> String {
         match self.login_page_override.clone() {
-            Some(v) => v,
+            Some(v) => format!("{}#{}/{}/login_json", v, path, TELEGRAM_AUTH_NAME),
             None => String::from(TELEGRAM_LOGIN_PAGE)
         }
     }
@@ -113,14 +131,63 @@ async fn stage1_json(
     })
 }
 
+pub fn check_hash(data: &TelegramLoginResponse, secret: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use std::collections::BTreeMap;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC any size");
+    let mut map = BTreeMap::new();
+    map.insert("id", &data.id);
+    map.insert("first_name", &data.first_name);
+    map.insert("last_name", &data.last_name);
+    map.insert("username", &data.username);
+    map.insert("photo_url", &data.photo_url);
+    map.insert("auth_date", &data.auth_date);
+
+    let mut check_arr: Vec<String> = map.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    check_arr.sort();
+    let check_string = check_arr.join("\n");
+
+    mac.update(check_string.as_bytes());
+    let result = mac.finalize();
+    let calculated_hash = hex::encode(result.into_bytes());
+
+    calculated_hash == data.hash
+}
+
 #[get("/stage2")]
 async fn stage2(
     app_data: web::Data<AppData>,
     req: HttpRequest,
+    info: web::Query<TelegramLoginResponse>,
 ) -> HttpResponse {
     log::debug!("request: {:?}", req);
+    let plugin = U!(get_plugin_data::<TelegramAuth>(&app_data, TELEGRAM_AUTH_NAME));
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if !check_hash(&info, &plugin.bot_token.as_str()) {
+        return HttpResponse::Unauthorized().json(ErrorResponse { error: "telegram hash mismatch"});
+    }
+
+    let auth_date = match info.auth_date.parse::<u64>() {
+        Ok(v) => UNIX_EPOCH + std::time::Duration::from_secs(v),
+        Err(_) => return HttpResponse::Unauthorized().json(ErrorResponse { error: "telegram auth_date unparsable"}),
+    };
+    let now = SystemTime::now();
+    match now.duration_since(auth_date) {
+        Ok(elapsed) => {
+            if elapsed > MAX_AUTH_RECEIVE_DURATION {
+                return HttpResponse::Unauthorized().json(ErrorResponse { error: "telegram auth_date too old"});
+            }
+        }
+        Err(_) => return HttpResponse::Unauthorized().json(ErrorResponse { error: "telegram auth_date is in the future"})
+    }
+
     finalize_login(app_data, req, super::AuthResult{
-        user: "none".to_string(),
-        issuer: "stub".to_string()
+        user: info.id.clone(),
+        issuer: TELEGRAM_AUTH_NAME.to_string()
     }).await
 }

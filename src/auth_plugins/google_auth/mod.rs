@@ -85,7 +85,7 @@ impl AuthPlugin for GoogleAuth {
         String::from(GOOGLE_AUTH_NAME)
     }
 
-    fn get_login_page(&self) -> String {
+    fn get_login_page(&self, _path: &String) -> String {
         String::from(GOOGLE_LOGIN_PAGE)
     }
     

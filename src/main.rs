@@ -151,7 +151,7 @@ fn get_plugin_attrs(plugin: &PluginContainer, forwarded_path: &String) -> Result
             return Err(HttpResponse::InternalServerError().finish())
         },
         Ok(plugin) => {
-            (plugin.get_login_page(), plugin.get_name())
+            (plugin.get_login_page(forwarded_path), plugin.get_name())
         }
     };
     let login_page = if login_page.starts_with("/") {
