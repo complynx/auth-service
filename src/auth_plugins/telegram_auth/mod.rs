@@ -64,7 +64,7 @@ async fn stage1(
     let plugin = U!(get_plugin_data::<TelegramAuth>(&app_data, TELEGRAM_AUTH_NAME));
     let mut html = String::from("<html><head><title>Login to telegram</title></head><body><h1>Login to telegram</h1><ul>");
     let forwarded = U!(parse_forwarded_headers(&req));
-    let uri = format!("{}:/{}{}/stage2",
+    let uri = format!("{}://{}{}/stage2",
         forwarded.proto,
         forwarded.host,
         forwarded.path,
