@@ -151,10 +151,12 @@ pub fn check_hash(data: &TelegramLoginResponse, secret: &str) -> bool {
     let mut check_arr: Vec<String> = map.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
     check_arr.sort();
     let check_string = check_arr.join("\n");
+    log::debug!("check string:\n{}",check_string);
 
     mac.update(check_string.as_bytes());
     let result = mac.finalize();
     let calculated_hash = hex::encode(result.into_bytes());
+    log::debug!("calculated hash {}, received hash {}", calculated_hash, data.hash);
 
     calculated_hash == data.hash
 }
