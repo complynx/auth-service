@@ -20,7 +20,6 @@ use util::{env_var, remove_path_last_part};
 use crate::util::get_header_string;
 
 const SESSION_COOKIE_NAME: &str = "session_id";
-const SESSION_COOKIE_HEADER: &str = "X-Session-Id";
 
 const FORWARDED_URI_HEADER: &str = "X-Forwarded-URI";
 const FORWARDED_HOST_HEADER: &str = "Host";
@@ -245,11 +244,13 @@ async fn check_session_and_keep(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
-    let session_id = match get_header_string(&req, SESSION_COOKIE_HEADER) {
-        Ok(value) => value,
-        Err(_) => {
+    let session_id = match req.cookie(SESSION_COOKIE_NAME) {
+        Some(cookie) => {
+            cookie.value().to_string()
+        }
+        None => {
             return forward_to_login(req, app_data, "no session found".to_string()).await
-        },
+        }
     };
 
     match auth_token_validate(&session_id, &app_data) {
