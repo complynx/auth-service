@@ -55,6 +55,8 @@ impl AuthPlugin for TelegramAuth {
     fn get_actix_scope(&self) -> Scope {
         web::scope(TELEGRAM_AUTH_PATH)
             .service(stage1)
+            .service(stage2)
+            .service(stage1_json)
     }
 }
 
