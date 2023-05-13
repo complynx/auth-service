@@ -135,11 +135,15 @@ async fn stage1_json(
 
 pub fn check_hash(data: &TelegramLoginResponse, secret: &str) -> bool {
     use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    use sha2::{Sha256, Digest};
     use std::collections::BTreeMap;
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC any size");
+    let mut hasher = Sha256::new();
+    hasher.update(secret);
+    let secret_hash = hasher.finalize();
+
+    let mut mac = HmacSha256::new_from_slice(&secret_hash).expect("HMAC any size");
     let mut map = BTreeMap::new();
     map.insert("id", &data.id);
     map.insert("first_name", &data.first_name);
