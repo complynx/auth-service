@@ -29,7 +29,7 @@ struct AuthorizationSession {
 
 type AuthStore = Arc<Mutex<HashMap<String, AuthorizationSession>>>;
 
-use super::basic_trait::{AuthPlugin, PluginContainer};
+use super::basic_trait::{AuthPlugin, PluginContainer, flag};
 #[derive(Clone)]
 struct GoogleAuth {
     client_id: ClientId,
@@ -37,8 +37,9 @@ struct GoogleAuth {
     keys: Vec<DecodingKey>,
     sessions: AuthStore,
 }
-const GOOGLE_AUTH_NAME: &str = "google_auth";
+const GOOGLE_AUTH_NAME: &str = "google";
 const GOOGLE_AUTH_PATH: &str = concatcp!("/", GOOGLE_AUTH_NAME);
+const GOOGLE_LOGIN_PAGE: &str = "login";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GoogleExtraTokenFields {
@@ -82,6 +83,10 @@ impl AuthPlugin for GoogleAuth {
 
     fn get_name(&self) -> String {
         String::from(GOOGLE_AUTH_NAME)
+    }
+
+    fn get_login_page(&self) -> String {
+        String::from(GOOGLE_LOGIN_PAGE)
     }
     
     fn get_actix_scope(&self) -> Scope {
@@ -129,12 +134,7 @@ async fn login(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let plugin = match get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME) {
-        Ok(value) => value,
-        Err(_) => {
-            return HttpResponse::InternalServerError().finish()
-        }
-    };
+    let plugin = U!(get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME));
 
     let mut auth_store = plugin.sessions.lock().unwrap();
 
@@ -197,10 +197,7 @@ async fn stage2(
     let code = AuthorizationCode::new(data.code);
     let state = CsrfToken::new(data.state);
 
-    let plugin = match get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME) {
-        Ok(val) => val,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
+    let plugin = U!(get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME));
     let mut auth_store = plugin.sessions.lock().unwrap();
 
     if let Some(auth_data) = auth_store.remove(session_id.as_str()) {
@@ -276,7 +273,11 @@ async fn clean_expired_auths(auth_store: AuthStore) {
     }
 }
 
-pub async fn init() -> Result<PluginContainer, std::io::Error> {
+pub async fn init(args: &Vec<String>, default_enabled: bool) -> Result<Option<PluginContainer>, std::io::Error> {
+    if !flag(args, GOOGLE_AUTH_NAME, default_enabled) {
+        return Ok(None);
+    }
+
     let client_id = ClientId::new(env_var("GOOGLE_CLIENT_ID")?);
     let client_secret = ClientSecret::new(env_var("GOOGLE_CLIENT_SECRET")?);
 
@@ -295,10 +296,10 @@ pub async fn init() -> Result<PluginContainer, std::io::Error> {
         clean_expired_auths(cleaner_session_auth_store).await;
     });
 
-    Ok(std::sync::Arc::new(std::sync::Mutex::new(GoogleAuth{
+    Ok(Some(std::sync::Arc::new(std::sync::Mutex::new(GoogleAuth{
         client_id,
         client_secret,
         keys,
         sessions,
-    })))
+    }))))
 }

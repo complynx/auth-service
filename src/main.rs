@@ -5,6 +5,7 @@ use actix_web::{
     get, web, App, HttpServer, Responder, HttpResponse,
     HttpRequest, cookie::Cookie
 };
+use auth_plugins::basic_trait::PluginContainer;
 // Alternatively, this can be oauth2::curl::http_client or a custom.
 use oauth2::{ClientSecret};
 use serde::{Serialize, Deserialize};
@@ -33,13 +34,13 @@ struct LoginResponse {
     session_id: String,
 }
 
-type PluginsOne = std::sync::Arc<std::sync::Mutex<dyn auth_plugins::basic_trait::AuthPlugin>>;
-type Plugins = HashMap<String, PluginsOne>;
+type Plugins = HashMap<String, PluginContainer>;
 
 #[derive(Clone)]
 pub struct AppData {
     jwt_secret: ClientSecret,
     plugins: Plugins,
+    login_page_override: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -143,20 +144,49 @@ async fn healthcheck() -> impl Responder {
     HttpResponse::Ok().finish()
 }
 
+fn get_plugin_attrs(plugin: &PluginContainer, forwarded_path: &String) -> Result<(String, String), HttpResponse> {
+    let (login_page, name) = match plugin.lock() {
+        Err(err) =>{
+            log::error!("failed to lock plugin: {}", err);
+            return Err(HttpResponse::InternalServerError().finish())
+        },
+        Ok(plugin) => {
+            (plugin.get_login_page(), plugin.get_name())
+        }
+    };
+    let login_page = if login_page.starts_with("/") {
+        login_page
+    } else {
+        format!("{}/{}/{}", forwarded_path, name, login_page)
+    };
+    Ok((name, login_page))
+}
+
 #[get("/login")]
 async fn login(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> HttpResponse {
     debug!("request: {:?}", req);
-    let mut html = String::from("<html><head><title>Login</title></head><body><h1>Login</h1><ul>");
     let forwarded = U!(parse_forwarded_headers(&req));
 
-    for plugin_name in app_data.plugins.keys() {
+    if app_data.plugins.len() == 1 {
+        let (_name, plugin) = app_data.plugins.iter().next().unwrap();
+        let (_name, login_page) = U!(get_plugin_attrs(plugin, &forwarded.path));
+        
+        return HttpResponse::SeeOther()
+            .append_header((actix_web::http::header::LOCATION, login_page))
+            .finish();
+    }
+
+    let mut html = String::from("<html><head><title>Login</title></head><body><h1>Login</h1><ul>");
+
+    for plugin in app_data.plugins.values() {
+        let (name, login_page) = U!(get_plugin_attrs(plugin, &forwarded.path));
         html.push_str(&format!(
-            r#"<li><a href="{source_path}/{plugin_name}/login">{plugin_name}</a></li>"#,
-            plugin_name = plugin_name,
-            source_path = forwarded.path
+            r#"<li><a href="{url}">{name}</a></li>"#,
+            url = login_page,
+            name = name
         ));
     }
 
@@ -175,26 +205,38 @@ async fn login_json(
 
     let mut plugins: HashMap<String, String> = HashMap::new();
 
-    for plugin_name in app_data.plugins.keys() {
+    for plugin in app_data.plugins.values() {
+        let (name, login_page) = U!(get_plugin_attrs(plugin, &forwarded.path));
         plugins.insert(
-            plugin_name.clone(),
-            format!("{}/{}", forwarded.path, plugin_name),
+            name,
+            login_page,
         );
     }
 
-    HttpResponse::Ok().content_type("application/json").json(plugins)
+    #[derive(Serialize, Clone, Debug)]
+    struct Ret {
+        plugins: HashMap<String, String>
+    }
+
+    HttpResponse::Ok().content_type("application/json").json(Ret{
+        plugins
+    })
 }
 
 async fn forward_to_login(
     req: HttpRequest,
-    _app_data: web::Data<AppData>,
+    app_data: web::Data<AppData>,
     err: String,
 ) -> HttpResponse {
     let forwarded = U!(parse_forwarded_headers(&req));
     let _originals = parse_original_headers(&req, &forwarded);
+    let login_path = match &app_data.login_page_override {
+        Some(uri) => format!("{}#{}/login_json", uri, forwarded.path),
+        None => format!("{}/login", forwarded.path)
+    };
 
     HttpResponse::Unauthorized()
-        .append_header((actix_web::http::header::LOCATION, format!("{}/login", forwarded.path)))
+        .append_header((actix_web::http::header::LOCATION, login_path))
         .json(ErrorResponse { error: err })
 }
 
@@ -246,21 +288,33 @@ async fn keep_alive(
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(Env::default().default_filter_or("debug"));
+    let args: Vec<String> = env::args().collect();
 
     let address = env::var("BIND_ADDRESS").unwrap_or("0.0.0.0:8080".to_string());
+    let login_page_override = env::var("LOGIN_PAGE_OVERRIDE").ok();
     let jwt_secret = ClientSecret::new(env_var("JWT_SECRET")?);
-    let plugins_array: Vec<PluginsOne> = vec![
-        auth_plugins::example_auth::init()?,
-        auth_plugins::google_auth::init().await?
+    let plugins_array: Vec<Option<PluginContainer>> = vec![
+        auth_plugins::example_auth::init(&args, false)?,
+        auth_plugins::google_auth::init(&args, false).await?,
+        auth_plugins::telegram_auth::init(&args, true)?,
     ];
     let mut plugins = Plugins::new();
-    for item in plugins_array {
-        let item_inner = item.lock().unwrap();
-        plugins.insert(item_inner.get_name(), item.clone());
+    for item_opt in plugins_array {
+        if let Some(item) = item_opt {
+            let item_inner = item.lock().unwrap();
+            plugins.insert(item_inner.get_name(), item.clone());
+        }
+    }
+    if plugins.len() < 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("No authorization plugins enabled.")
+        ))
     }
     let app_data = AppData{
         jwt_secret,
         plugins,
+        login_page_override,
     };
     
 
