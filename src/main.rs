@@ -9,7 +9,7 @@ use auth_plugins::basic_trait::PluginContainer;
 // Alternatively, this can be oauth2::curl::http_client or a custom.
 use oauth2::{ClientSecret};
 use serde::{Serialize, Deserialize};
-use std::{time::{UNIX_EPOCH, SystemTime}, collections::HashMap};
+use std::collections::HashMap;
 use actix_web::middleware::Logger;
 use env_logger::Env;
 use std::env;
@@ -20,6 +20,10 @@ use util::{env_var, remove_path_last_part};
 use crate::util::get_header_string;
 
 const SESSION_COOKIE_NAME: &str = "session_id";
+const SESSION_COOKIE_LIFETIME: u64 = 3600;
+
+const LOGIN_COOKIE_NAME: &str = "login_id";
+const LOGIN_COOKIE_LIFETIME: u64 = 3600;
 
 const FORWARDED_URI_HEADER: &str = "X-Forwarded-URI";
 const FORWARDED_HOST_HEADER: &str = "Host";
@@ -27,6 +31,7 @@ const FORWARDED_PROTO_HEADER: &str = "X-Forwarded-Proto";
 
 const ORIGINAL_URI_HEADER: &str = "X-Original-URI";
 const ORIGINAL_METHOD_HEADER: &str = "X-Original-Method";
+const LOGIN_SUCCESS_HEADER: &str = "X-Login-Success";
 
 #[derive(Serialize, Debug)]
 struct LoginResponse {
@@ -40,12 +45,20 @@ pub struct AppData {
     jwt_secret: ClientSecret,
     plugins: Plugins,
     login_page_override: Option<String>,
+    login_success_page: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct AuthToken{
     sub: String,
     exp: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct LoginJWT{
+    sub: String,
+    exp: u64,
+    location: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -69,25 +82,25 @@ pub struct Original {
     method: String,
 }
 
-fn create_token_cookie<'c>(app_data: web::Data<AppData>, mut token: AuthToken) -> Cookie<'c> {
-    let expiration_seconds = 3600;
-    let exp = SystemTime::now().duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs() + expiration_seconds;
+macro_rules! cookify_jwt {
+    ($app_data:expr, $token:expr, $life_time:expr, $cookie_name:expr) => {{
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs() + $life_time;
+        $token.exp = exp;
 
-    token.exp = exp;
+        let secret = jsonwebtoken::EncodingKey::from_secret($app_data.jwt_secret.secret().as_bytes());
 
-    let secret = jsonwebtoken::EncodingKey::from_secret(app_data.jwt_secret.secret().as_bytes());
-
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-    let auth_token = jsonwebtoken::encode(&header, &token, &secret).unwrap();
-
-    return Cookie::build(SESSION_COOKIE_NAME, auth_token)
-        .path("/")
-        .secure(true)
-        .http_only(true)
-        .max_age(actix_web::cookie::time::Duration::seconds(expiration_seconds.try_into().unwrap()))
-        .finish();
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let token_str = jsonwebtoken::encode(&header, &$token, &secret).unwrap();
+        Cookie::build($cookie_name, token_str)
+            .path("/")
+            .secure(true)
+            .http_only(true)
+            .max_age(actix_web::cookie::time::Duration::seconds($life_time.try_into().unwrap()))
+            .finish()
+    }};
 }
 
 fn parse_forwarded_headers(req: &HttpRequest) -> Result<Forwarded, HttpResponse> {
@@ -118,24 +131,38 @@ fn parse_original_headers(req: &HttpRequest, forwarded: &Forwarded) -> Original 
 
 async fn finalize_login(
     app_data: web::Data<AppData>,
-    _req: HttpRequest,
+    req: HttpRequest,
     auth_result: auth_plugins::AuthResult,
 ) -> HttpResponse {
     debug!("result: {:?}", auth_result);
-    let claims = AuthToken {
+    let mut claims = AuthToken {
         sub: format!("{}:{}", auth_result.issuer, auth_result.user),
         exp: 0,
     };
 
-    HttpResponse::Ok()
-        .cookie(create_token_cookie(app_data, claims))
+    let after_login = match req.cookie(LOGIN_COOKIE_NAME) {
+        Some(cookie) => match token_validate::<LoginJWT>(cookie.value(), &app_data.jwt_secret) {
+            Ok(token) => token.location,
+            Err(_) => "/".to_string()
+        }
+        None => "/".to_string()
+    };
+
+    HttpResponse::SeeOther()
+        .cookie(cookify_jwt!(
+            app_data,
+            claims,
+            SESSION_COOKIE_LIFETIME,
+            SESSION_COOKIE_NAME
+        ))
+        .append_header((actix_web::http::header::LOCATION, after_login))
         .finish()
 }
 
-fn auth_token_validate(token: &str, app_data: &AppData) -> Result<AuthToken, jsonwebtoken::errors::Error> {
+fn token_validate<T: for<'de> serde::Deserialize<'de>>(token: &str, secret: &ClientSecret) -> Result<T, jsonwebtoken::errors::Error> {
     let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
-    let secret = jsonwebtoken::DecodingKey::from_secret(app_data.jwt_secret.secret().as_bytes());
-    Ok(decode::<AuthToken>(&token, &secret, &validation)?.claims)
+    let secret = jsonwebtoken::DecodingKey::from_secret(secret.secret().as_bytes());
+    Ok(decode::<T>(&token, &secret, &validation)?.claims)
 }
 
 #[get("/healthcheck")]
@@ -228,53 +255,62 @@ async fn forward_to_login(
     err: String,
 ) -> HttpResponse {
     let forwarded = U!(parse_forwarded_headers(&req));
-    let _originals = parse_original_headers(&req, &forwarded);
+    let originals = parse_original_headers(&req, &forwarded);
     let login_path = match &app_data.login_page_override {
         Some(uri) => format!("{}#{}/login_json", uri, forwarded.path),
         None => format!("{}/login", forwarded.path)
     };
+    let login_success_page = if originals.method == "GET" {
+        originals.uri
+    } else {
+        get_header_string(&req, LOGIN_SUCCESS_HEADER).unwrap_or(app_data.login_success_page.clone())
+    };
+
+    let mut login_jwt = LoginJWT {
+        sub: String::from(""),
+        exp: 0,
+        location: login_success_page
+    };
 
     HttpResponse::Unauthorized()
         .append_header((actix_web::http::header::LOCATION, login_path))
+        .cookie(cookify_jwt!(app_data, login_jwt, LOGIN_COOKIE_LIFETIME, LOGIN_COOKIE_NAME))
         .json(ErrorResponse { error: err })
 }
 
-async fn check_session_and_keep(
-    do_keep_alive: bool,
+async fn check_session(
     req: HttpRequest,
     app_data: web::Data<AppData>,
-) -> impl Responder {
+) -> Result<AuthToken, HttpResponse> {
     let session_id = match req.cookie(SESSION_COOKIE_NAME) {
         Some(cookie) => {
             cookie.value().to_string()
         }
         None => {
-            return forward_to_login(req, app_data, "no session found".to_string()).await
+            return Err(forward_to_login(req, app_data, "no session found".to_string()).await)
         }
     };
 
-    match auth_token_validate(&session_id, &app_data) {
+    match token_validate::<AuthToken>(&session_id, &app_data.jwt_secret) {
         Ok(token) => {
-            let mut builder = HttpResponse::Ok();
-            if do_keep_alive {
-                builder.cookie(create_token_cookie(app_data, token));
-            }
-            builder.finish()
+            Ok(token)
         },
         Err(err) =>{
             info!("token validation failed: {}", err);
-            forward_to_login(req, app_data.clone(), "session is not valid".to_string()).await
+            Err(forward_to_login(req, app_data.clone(), "session is not valid".to_string()).await)
         }
     }
 }
 
 #[get("/check")]
-async fn check_session(
+async fn check(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
     debug!("request: {:?}", req);
-    check_session_and_keep(false, req, app_data).await
+    let _token = U!(check_session(req, app_data).await);
+
+    HttpResponse::Ok().finish()
 }
 
 #[get("/keep-alive")]
@@ -283,7 +319,14 @@ async fn keep_alive(
     app_data: web::Data<AppData>,
 ) -> impl Responder {
     debug!("request: {:?}", req);
-    check_session_and_keep(true, req, app_data).await
+    let mut token = U!(check_session(req, app_data.clone()).await);
+
+    HttpResponse::Ok().cookie(cookify_jwt!(
+            app_data,
+            token,
+            SESSION_COOKIE_LIFETIME,
+            SESSION_COOKIE_NAME
+        )).finish()
 }
 
 #[actix_web::main]
@@ -293,6 +336,7 @@ async fn main() -> std::io::Result<()> {
 
     let address = env::var("BIND_ADDRESS").unwrap_or("0.0.0.0:8080".to_string());
     let login_page_override = env::var("LOGIN_PAGE_OVERRIDE").ok();
+    let login_success_page = env::var("DEFAULT_LOGIN_SUCCESS_PAGE").unwrap_or("/".to_string());
     let jwt_secret = ClientSecret::new(env_var("JWT_SECRET")?);
     let plugins_array: Vec<Option<PluginContainer>> = vec![
         auth_plugins::example_auth::init(&args, false)?,
@@ -316,6 +360,7 @@ async fn main() -> std::io::Result<()> {
         jwt_secret,
         plugins,
         login_page_override,
+        login_success_page,
     };
     
 
@@ -326,7 +371,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(app_data.clone()))
             .service(
                 web::scope("/auth")
-                    .service(check_session)
+                    .service(check)
                     .service(keep_alive)
                     .service(login)
                     .service(login_json)
