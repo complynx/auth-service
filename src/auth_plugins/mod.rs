@@ -8,4 +8,5 @@ pub mod basic_trait;
 pub struct AuthResult {
     pub user: String,
     pub issuer: String,
+    pub data: serde_json::Value,
 }

@@ -1,5 +1,7 @@
 use actix_web::HttpResponse;
 
+use crate::err_internal;
+
 
 pub trait AuthPlugin: Send{
     fn get_name(&self) -> String;
@@ -17,7 +19,7 @@ pub fn get_plugin_data<T: 'static + Clone>(
         Some(value) => value,
         None => {
             log::error!("failed to get plugin data for {}", plugin_name);
-            return Err(HttpResponse::InternalServerError().finish());
+            return Err(err_internal());
         }
     };
 
@@ -25,7 +27,7 @@ pub fn get_plugin_data<T: 'static + Clone>(
         Ok(guard) => guard,
         Err(err) => {
             log::error!("failed to lock plugin data for {}: {}", plugin_name, err);
-            return Err(HttpResponse::InternalServerError().finish());
+            return Err(err_internal());
         }
     };
 
@@ -33,7 +35,7 @@ pub fn get_plugin_data<T: 'static + Clone>(
         Some(value) => value,
         None => {
             log::error!("failed to cast plugin data for {} to {}", plugin_name, std::any::type_name::<T>());
-            return Err(HttpResponse::InternalServerError().finish());
+            return Err(err_internal());
         }
     };
 

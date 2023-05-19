@@ -49,6 +49,7 @@ async fn authenticate(
     // some code
     finalize_login(app_data, req, super::AuthResult{
         user: "none".to_string(),
-        issuer: "stub".to_string()
+        issuer: "stub".to_string(),
+        data: serde_json::Value::Null,
     }).await
 }
