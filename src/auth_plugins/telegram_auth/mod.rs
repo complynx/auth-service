@@ -83,6 +83,16 @@ pub fn init(args: &Vec<String>, default_enabled: bool) -> Result<Option<PluginCo
     }))))
 }
 
+fn create_url(req: &HttpRequest) -> Result<String, HttpResponse> {
+    let forwarded = parse_forwarded_headers(&req)?;
+    let uri = format!("{}://{}{}/stage2",
+        forwarded.proto,
+        forwarded.host,
+        forwarded.path,
+    );
+    Ok(uri)
+}
+
 #[get("/login")]
 async fn stage1(
     app_data: web::Data<AppData>,
@@ -91,12 +101,7 @@ async fn stage1(
     log::debug!("request: {:?}", req);
     let plugin = U!(get_plugin_data::<TelegramAuth>(&app_data, TELEGRAM_AUTH_NAME));
     let mut html = String::from("<html><head><title>Login to telegram</title></head><body><h1>Login to telegram</h1><ul>");
-    let forwarded = U!(parse_forwarded_headers(&req));
-    let uri = format!("{}://{}{}/stage2",
-        forwarded.proto,
-        forwarded.host,
-        forwarded.path,
-    );
+    let uri = U!(create_url(&req));
 
     html.push_str(&format!(
         r#"<script async src="https://telegram.org/js/telegram-widget.js?22"
@@ -127,12 +132,7 @@ async fn stage1_json(
 
     log::debug!("request: {:?}", req);
     let plugin = U!(get_plugin_data::<TelegramAuth>(&app_data, TELEGRAM_AUTH_NAME));
-    let forwarded = U!(parse_forwarded_headers(&req));
-    let uri = format!("{}:/{}{}/stage2",
-        forwarded.proto,
-        forwarded.host,
-        forwarded.path,
-    );
+    let uri = U!(create_url(&req));
 
     
     HttpResponse::Ok().content_type("application/json").json(Ret{
