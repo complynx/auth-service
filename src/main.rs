@@ -4,7 +4,7 @@ mod database;
 mod admin;
 
 use actix_web::{
-    get, web, App, HttpServer, Responder, HttpResponse,
+    get, post, web, App, HttpServer, Responder, HttpResponse,
     HttpRequest, cookie::Cookie
 };
 use auth_plugins::basic_trait::PluginContainer;
@@ -322,6 +322,33 @@ async fn permissions(
     })
 }
 
+#[post("/permissions")]
+async fn permissions_check(
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+    permissions_to_check: web::Json<Vec<String>>,
+) -> HttpResponse {
+    debug!("request: {:?}", req);
+    let token = U!(check_session(req.clone(), app_data.clone()).await);
+    let user = U!(crate::admin::get_current_user(&app_data, &token).await);
+    if user.is_su() {
+        return HttpResponse::Ok().content_type("application/json").json(permissions_to_check);
+    }
+
+    let perms = U!(user.get_permissions().await.map_err(|err| {
+        log::error!("failed to get user permissions: {}", err);
+        err_internal()
+    }));
+
+    let intersection: Vec<String> = permissions_to_check
+        .iter()
+        .filter(|element| perms.contains(element))
+        .cloned()
+        .collect();
+
+    HttpResponse::Ok().content_type("application/json").json(intersection)
+}
+
 async fn forward_to_login(
     req: HttpRequest,
     app_data: web::Data<AppData>,
@@ -468,6 +495,7 @@ async fn main() -> std::io::Result<()> {
                     .service(check)
                     .service(keep_alive)
                     .service(permissions)
+                    .service(permissions_check)
                     .service(login)
                     .service(login_json)
                     .configure(|cfg| {

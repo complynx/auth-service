@@ -192,6 +192,20 @@ impl std::fmt::Display for RoleDescription {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserOuterDescription {
+    pub id: i64,
+    pub issuer: String,
+    pub outer_id: String,
+    pub data: serde_json::Value,
+}
+
+impl std::fmt::Display for UserOuterDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UserOuter(#{} outer({}|{}): {})", self.id, self.issuer, self.outer_id, self.data)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionDescription {
     pub id: i64,
     pub name: String,
@@ -223,6 +237,50 @@ impl Database {
         Ok(Self{
             conn,
         })
+    }
+
+    pub async fn get_users(&self) -> Result<Vec<UserOuterDescription>, Box<dyn Error>> {
+        #[derive(Clone)]
+        struct UserOuterInterim {
+            id: i64,
+            issuer: String,
+            outer_id: String,
+            data: String,
+        }
+        let ret = self.conn.call(move |conn| {
+            let mut query = conn.prepare("
+                SELECT
+                    user_id, issuer, outer_id, data
+                FROM user_oauth
+            ")?;
+            let rows = query.query_map(
+                params![],
+                |row| Ok(UserOuterInterim{
+                    id: row.get(0)?,
+                    issuer: row.get(1)?,
+                    outer_id: row.get(2)?,
+                    data: row.get(3)?,
+                })
+            )?;
+            let mut ret = Vec::new();
+            for role in rows {
+                ret.push(role?);
+            }
+            Ok(ret)
+        }).await?;
+        let result: Result<Vec<UserOuterDescription>, Box<dyn std::error::Error>> = ret
+            .into_iter()
+            .map(|interim| {
+                let data: serde_json::Value = serde_json::from_str(&interim.data)?;
+                Ok(UserOuterDescription {
+                    id: interim.id,
+                    issuer: interim.issuer,
+                    outer_id: interim.outer_id,
+                    data,
+                })
+            })
+            .collect();
+        result
     }
 
     pub async fn get_roles(&self) -> Result<Vec<RoleDescription>, Box<dyn Error>> {

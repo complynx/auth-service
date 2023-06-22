@@ -368,6 +368,24 @@ async fn create_permission(
     HttpResponse::Ok().json(permission)
 }
 
+#[get("/users")]
+async fn get_users(
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    log::debug!("request: {:?}", req);
+    let token = U!(check_session(req, app_data.clone()).await);
+    let current_user = U!(get_current_user(&app_data, &token).await);
+    U!(permit(&current_user, PERMISSION_VIEW_USERS).await);
+
+    let users =  U!(app_data.as_ref().database.get_users().await.map_err(|err| {
+        log::error!("failed to fetch permission: {}", err);
+        err_internal()
+    }));
+
+    HttpResponse::Ok().json(users)
+}
+
 #[post("/user/{id}/roles")]
 async fn change_user_roles(
     id: web::Path<i64>,
@@ -474,6 +492,7 @@ async fn user_roles(
 
 pub fn init() -> actix_web::Scope {
     actix_web::Scope::new("/adm")
+        .service(get_users)
         .service(user_roles)
         .service(change_user_roles)
         .service(get_roles)
