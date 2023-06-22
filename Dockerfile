@@ -4,6 +4,8 @@ FROM rust:latest as builder
 # Set the working directory to /app
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y libsqlcipher-dev
+
 # Copy over your Cargo.toml and Cargo.lock
 COPY Cargo.toml Cargo.lock ./
 
@@ -26,6 +28,8 @@ RUN cargo build --release
 
 # Use a minimal runtime image
 FROM debian:buster-slim
+
+RUN apt-get update && apt-get install -y libsqlcipher0
 
 # Install SSL certificates
 RUN apt-get update && \
