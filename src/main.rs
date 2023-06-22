@@ -308,8 +308,18 @@ async fn permissions(
         log::error!("failed to get user permissions: {}", err);
         err_internal()
     }));
+    let is_su = user.is_su();
 
-    HttpResponse::Ok().content_type("application/json").json(perms)
+    #[derive(Serialize, Clone, Debug)]
+    struct Ret {
+        permissions: Vec<String>,
+        is_su: bool,
+    }
+
+    HttpResponse::Ok().content_type("application/json").json(Ret{
+        permissions: perms,
+        is_su,
+    })
 }
 
 async fn forward_to_login(
