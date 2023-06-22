@@ -14,7 +14,7 @@ use uuid::Uuid;
 use const_format::concatcp;
 
 use crate::auth_plugins::basic_trait::get_plugin_data;
-use crate::{parse_forwarded_headers, U};
+use crate::{parse_forwarded_headers, U, err_internal};
 
 use super::super::{finalize_login, AppData};
 use super::super::util::{env_var};
@@ -131,7 +131,7 @@ async fn login(
         Ok(v) => v,
         Err(e) => {
             error!("RedirectUrl parse error: {}", e);
-            return HttpResponse::InternalServerError().finish();
+            return err_internal();
         }
     };
     let plugin = U!(get_plugin_data::<GoogleAuth>(&app_data, GOOGLE_AUTH_NAME));
@@ -216,12 +216,15 @@ async fn stage2(
                     match validate_google_token(&plugin, token_response_unwrapped.extra_fields().id_token.as_str()) {
                         Ok(token) => finalize_login(app_data.clone(), req, super::AuthResult{
                             user: token.sub,
-                            issuer: plugin.get_name()
+                            issuer: plugin.get_name(),
+                            data: serde_json::json!({
+                                "email": token.email.clone()
+                            }),
                         }).await,
                         Err(err) => {
                             info!("google token validation failed {}", err);
-                            HttpResponse::InternalServerError()
-                                .json(ErrorResponse { error: "No email found in the JWT" })
+                            HttpResponse::Unauthorized()
+                                .json(ErrorResponse { error: "Google JWT validation failed" })
                         },
                     }
                 },

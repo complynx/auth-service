@@ -1,13 +1,16 @@
 mod auth_plugins;
 mod util;
+mod database;
+mod admin;
 
 use actix_web::{
-    get, web, App, HttpServer, Responder, HttpResponse,
+    get, post, web, App, HttpServer, Responder, HttpResponse,
     HttpRequest, cookie::Cookie
 };
 use auth_plugins::basic_trait::PluginContainer;
 // Alternatively, this can be oauth2::curl::http_client or a custom.
-use oauth2::{ClientSecret};
+use oauth2::ClientSecret;
+use regex::Regex;
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use actix_web::middleware::Logger;
@@ -17,7 +20,7 @@ use jsonwebtoken::{decode, Validation};
 use log::{debug, info};
 use util::{env_var, remove_path_last_part};
 
-use crate::util::get_header_string;
+use crate::{util::get_header_string, database::User};
 
 const SESSION_COOKIE_NAME: &str = "session_id";
 const SESSION_COOKIE_LIFETIME: u64 = 3600;
@@ -33,6 +36,8 @@ const ORIGINAL_URI_HEADER: &str = "X-Original-URI";
 const ORIGINAL_METHOD_HEADER: &str = "X-Original-Method";
 const LOGIN_SUCCESS_HEADER: &str = "X-Login-Success";
 
+const HAS_PERMISSION_HEADER: &str = "X-Has-Permission";
+
 #[derive(Serialize, Debug)]
 struct LoginResponse {
     session_id: String,
@@ -46,12 +51,14 @@ pub struct AppData {
     plugins: Plugins,
     login_page_override: Option<String>,
     login_success_page: String,
+    database: database::Database,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct AuthToken{
     sub: String,
     exp: u64,
+    roles: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -66,6 +73,10 @@ struct ErrorResponse {
     error: String,
 }
 
+pub fn err_internal() -> HttpResponse {
+    HttpResponse::InternalServerError()
+        .json(ErrorResponse{error:"internal server error".to_string()})
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
@@ -75,6 +86,7 @@ pub struct Forwarded {
     host: String,
     proto: String,
 }
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct Original {
@@ -106,7 +118,7 @@ macro_rules! cookify_jwt {
 fn parse_forwarded_headers(req: &HttpRequest) -> Result<Forwarded, HttpResponse> {
     fn h(req: &HttpRequest, s: &str) -> Result<String, HttpResponse> {
         get_header_string(req, s)
-            .map_err(|err| HttpResponse::InternalServerError().body(format!("{} header error: {}", s, err)))
+            .map_err(|err| {log::error!("failed to extract header {}: {}", s, err);err_internal()})
     }
     let uri = h(req, FORWARDED_URI_HEADER)?;
     let proto = h(req, FORWARDED_PROTO_HEADER)?;
@@ -135,8 +147,43 @@ async fn finalize_login(
     auth_result: auth_plugins::AuthResult,
 ) -> HttpResponse {
     debug!("result: {:?}", auth_result);
+
+    let user = match User::get_by_outer_id(
+        app_data.database.clone(),
+        auth_result.issuer.clone(),
+        auth_result.user.clone(),
+    ).await {
+        Ok(value) => value,
+        Err(err) => match err.downcast_ref::<rusqlite::Error>() {
+            Some(rusqlite::Error::QueryReturnedNoRows) => {
+                match User::create_new_guest_oauth(
+                    app_data.database.clone(),
+                    auth_result.issuer.clone(),
+                    auth_result.user.clone(),
+                ).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        log::error!("failed to create user: {}", err);
+                        return err_internal()
+                    }
+                }
+            }
+            _ => {
+                log::error!("failed to get user: {}", err);
+                return err_internal()
+            }
+        }
+    };
+    match user.update_oauth_data(auth_result.data).await {
+        Ok(_) => {},
+        Err(err) => {
+            log::warn!("failed to update user oauth data: {}", err);
+        }
+    };
+
     let mut claims = AuthToken {
-        sub: format!("{}:{}", auth_result.issuer, auth_result.user),
+        sub: user.id.to_string(),
+        roles: user.roles.into_iter().collect(),
         exp: 0,
     };
 
@@ -174,7 +221,7 @@ fn get_plugin_attrs(plugin: &PluginContainer, forwarded_path: &String) -> Result
     let (login_page, name) = match plugin.lock() {
         Err(err) =>{
             log::error!("failed to lock plugin: {}", err);
-            return Err(HttpResponse::InternalServerError().finish())
+            return Err(err_internal())
         },
         Ok(plugin) => {
             (plugin.get_login_page(forwarded_path), plugin.get_name())
@@ -249,6 +296,59 @@ async fn login_json(
     })
 }
 
+#[get("/permissions")]
+async fn permissions(
+    req: HttpRequest,
+    app_data: web::Data<AppData>
+) -> HttpResponse {
+    debug!("request: {:?}", req);
+    let token = U!(check_session(req.clone(), app_data.clone()).await);
+    let user = U!(crate::admin::get_current_user(&app_data, &token).await);
+    let perms = U!(user.get_permissions().await.map_err(|err| {
+        log::error!("failed to get user permissions: {}", err);
+        err_internal()
+    }));
+    let is_su = user.is_su();
+
+    #[derive(Serialize, Clone, Debug)]
+    struct Ret {
+        permissions: Vec<String>,
+        is_su: bool,
+    }
+
+    HttpResponse::Ok().content_type("application/json").json(Ret{
+        permissions: perms,
+        is_su,
+    })
+}
+
+#[post("/permissions")]
+async fn permissions_check(
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+    permissions_to_check: web::Json<Vec<String>>,
+) -> HttpResponse {
+    debug!("request: {:?}", req);
+    let token = U!(check_session(req.clone(), app_data.clone()).await);
+    let user = U!(crate::admin::get_current_user(&app_data, &token).await);
+    if user.is_su() {
+        return HttpResponse::Ok().content_type("application/json").json(permissions_to_check);
+    }
+
+    let perms = U!(user.get_permissions().await.map_err(|err| {
+        log::error!("failed to get user permissions: {}", err);
+        err_internal()
+    }));
+
+    let intersection: Vec<String> = permissions_to_check
+        .iter()
+        .filter(|element| perms.contains(element))
+        .cloned()
+        .collect();
+
+    HttpResponse::Ok().content_type("application/json").json(intersection)
+}
+
 async fn forward_to_login(
     req: HttpRequest,
     app_data: web::Data<AppData>,
@@ -302,13 +402,27 @@ async fn check_session(
     }
 }
 
+fn validate_varname_str(input: &str, length: usize) -> bool {
+    if 0 < input.len() && input.len() < length {
+        return false;
+    }
+    Regex::new(r"^[A-Za-z0-9_-]+$").unwrap().is_match(input)
+}
+
 #[get("/check")]
 async fn check(
     req: HttpRequest,
     app_data: web::Data<AppData>,
 ) -> impl Responder {
     debug!("request: {:?}", req);
-    let _token = U!(check_session(req, app_data).await);
+    let token = U!(check_session(req.clone(), app_data.clone()).await);
+
+    if let Ok(permission) = get_header_string(&req, HAS_PERMISSION_HEADER) {
+        if validate_varname_str(&permission, crate::admin::MAX_PERMISSION_LENGTH) {
+            let user = U!(crate::admin::get_current_user(&app_data, &token).await);
+            U!(crate::admin::permit(&user, &permission).await);
+        }
+    }
 
     HttpResponse::Ok().finish()
 }
@@ -361,6 +475,12 @@ async fn main() -> std::io::Result<()> {
         plugins,
         login_page_override,
         login_success_page,
+        database: database::Database::new().await.map_err(|e|
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to open database: {}", e)
+            )
+        )?
     };
     
 
@@ -371,8 +491,11 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(app_data.clone()))
             .service(
                 web::scope("/auth")
+                    .service(admin::init())
                     .service(check)
                     .service(keep_alive)
+                    .service(permissions)
+                    .service(permissions_check)
                     .service(login)
                     .service(login_json)
                     .configure(|cfg| {

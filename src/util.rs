@@ -3,7 +3,6 @@ use std::env;
 use actix_web::HttpRequest;
 use log::debug;
 
-
 pub fn env_var(key: &str) -> Result<String, std::io::Error> {
     match env::var(key) {
         Ok(s) => {
@@ -29,6 +28,19 @@ macro_rules! U {
         match $expr {
             Ok(value) => value,
             Err(err) => return err,
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! P {
+    ($expr:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(err) => {
+                log::error!("Error: {}", err);
+                return
+            },
         }
     };
 }

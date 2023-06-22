@@ -3,7 +3,7 @@ use actix_web::{web, get, HttpRequest, HttpResponse, Scope};
 use const_format::concatcp;
 use serde::{Serialize, Deserialize};
 use crate::util::env_var;
-use crate::{parse_forwarded_headers, U};
+use crate::{parse_forwarded_headers, U, err_internal};
 use crate::auth_plugins::basic_trait::get_plugin_data;
 use super::super::{finalize_login, AppData};
 use super::basic_trait::{AuthPlugin, PluginContainer, flag};
@@ -29,6 +29,14 @@ pub struct TelegramLoginResponse {
     photo_url: String,
     auth_date: String,
     hash: String,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct TelegramData {
+    first_name: String,
+    last_name: String,
+    username: String,
+    photo_url: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -193,9 +201,22 @@ async fn stage2(
         }
         Err(_) => return HttpResponse::Unauthorized().json(ErrorResponse { error: "telegram auth_date is in the future"})
     }
+    let data = match serde_json::to_value(TelegramData{
+        first_name: info.first_name.clone(),
+        last_name: info.last_name.clone(),
+        username: info.username.clone(),
+        photo_url: info.photo_url.clone(),
+    }) {
+        Ok(t) => t,
+        Err(err) =>{
+            log::error!("failed to serialize TelegramData: {}", err);
+            return err_internal()
+        }
+    };
 
     finalize_login(app_data, req, super::AuthResult{
         user: info.id.clone(),
-        issuer: TELEGRAM_AUTH_NAME.to_string()
+        issuer: TELEGRAM_AUTH_NAME.to_string(),
+        data,
     }).await
 }
