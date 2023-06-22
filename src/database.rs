@@ -21,7 +21,7 @@ fn prepare_database(conn: &rusqlite::Connection) -> Result<()> {
     {// create tables
         conn.execute(
             "CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT
             )",
             params![],
         )?;
@@ -78,6 +78,7 @@ fn prepare_database(conn: &rusqlite::Connection) -> Result<()> {
             )",
             params![],
         )?;
+        log::debug!("tables ok");
     }
 
     {// create default roles
@@ -99,6 +100,7 @@ fn prepare_database(conn: &rusqlite::Connection) -> Result<()> {
                 )?;
             }
         }
+        log::debug!("roles ok");
     }
 
     {// create admin permissions
@@ -131,6 +133,7 @@ fn prepare_database(conn: &rusqlite::Connection) -> Result<()> {
                 )?;
             }
         }
+        log::debug!("admin perms ok");
     }
 
     {// add su admin
@@ -172,6 +175,7 @@ fn prepare_database(conn: &rusqlite::Connection) -> Result<()> {
                 )?;
             }
         }
+        log::debug!("su ok");
     }
 
     Ok(())
@@ -225,11 +229,15 @@ impl Database {
         let db_file = format!("{}/auth.db", path);
 
         let conn = Connection::open(db_file).await?;
+        log::debug!("open ok");
         if let Some(secret_str) = secret {
+            let secret_str = secret_str.replace("'", "''");
+            let sql_command = format!("PRAGMA KEY='{}'", secret_str);
             conn.call(move |conn| {
-                conn.execute("PRAGMA key = ?1", params![secret_str])
+                conn.execute(&sql_command, params![])
             }).await?;
         }
+        log::debug!("pragma ok");
         conn.call(|conn| {
             prepare_database(&conn)
         }).await?;

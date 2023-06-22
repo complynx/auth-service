@@ -478,7 +478,7 @@ async fn main() -> std::io::Result<()> {
         database: database::Database::new().await.map_err(|e|
             std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("failed to open database: {}", e)
+                format!("failed to open database: {:?}", e)
             )
         )?
     };
