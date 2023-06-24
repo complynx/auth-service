@@ -383,7 +383,28 @@ async fn get_users(
         err_internal()
     }));
 
-    HttpResponse::Ok().json(users)
+    HttpResponse::Ok().json(json!({
+        "users": users
+    }))
+}
+
+#[get("/self")]
+async fn get_self(
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    log::debug!("request: {:?}", req);
+    let token = U!(check_session(req, app_data.clone()).await);
+    let current_user = U!(get_current_user(&app_data, &token).await);
+
+    let user =  U!(app_data.as_ref().database.get_user(current_user.id).await.map_err(|err| {
+        log::error!("failed to fetch self: {}", err);
+        err_internal()
+    }));
+
+    HttpResponse::Ok().json(json!({
+        "self": user
+    }))
 }
 
 #[post("/user/{id}/roles")]
@@ -467,11 +488,16 @@ async fn user_roles(
     log::debug!("request: {:?}", req);
     let token = U!(check_session(req, app_data.clone()).await);
     let current_user = U!(get_current_user(&app_data, &token).await);
+    let mut id_fix = *id;
+    
+    if id_fix < 0 {
+        id_fix = current_user.id;
+    }
 
-    if *id.as_ref() != current_user.id {
+    if id_fix != current_user.id {
         U!(permit(&current_user, PERMISSION_VIEW_USER_ROLES).await);
     }
-    let user = U!(User::get_by_id(app_data.database.clone(), *id).await.map_err(|err| if is_not_found(&err) {
+    let user = U!(User::get_by_id(app_data.database.clone(), id_fix).await.map_err(|err| if is_not_found(&err) {
         HttpResponse::NotFound().json(ErrorResponse{error:"user not found".to_string()})
     } else {
         log::error!("failed to fetch user: {}", err);
@@ -492,6 +518,7 @@ async fn user_roles(
 
 pub fn init() -> actix_web::Scope {
     actix_web::Scope::new("/adm")
+        .service(get_self)
         .service(get_users)
         .service(user_roles)
         .service(change_user_roles)

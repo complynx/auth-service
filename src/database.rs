@@ -291,6 +291,40 @@ impl Database {
         result
     }
 
+    pub async fn get_user(&self, id: i64) -> Result<UserOuterDescription, Box<dyn Error>> {
+        #[derive(Clone)]
+        struct UserOuterInterim {
+            id: i64,
+            issuer: String,
+            outer_id: String,
+            data: String,
+        }
+        let ret = self.conn.call(move |conn| {
+            let row: UserOuterInterim = conn.query_row("
+                SELECT
+                    user_id, issuer, outer_id, data
+                FROM user_oauth
+                WHERE user_id = ?1
+                ",
+                params![id],
+                |row| Ok(UserOuterInterim{
+                    id: row.get(0)?,
+                    issuer: row.get(1)?,
+                    outer_id: row.get(2)?,
+                    data: row.get(3)?,
+                })
+            )?;
+            Ok(row)
+        }).await?;
+        let data: serde_json::Value = serde_json::from_str(&ret.data)?;
+        Ok(UserOuterDescription {
+            id: ret.id,
+            issuer: ret.issuer,
+            outer_id: ret.outer_id,
+            data,
+        })
+    }
+
     pub async fn get_roles(&self) -> Result<Vec<RoleDescription>, Box<dyn Error>> {
         let ret = self.conn.call(move |conn| {
             let mut query = conn.prepare("
