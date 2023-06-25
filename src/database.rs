@@ -451,7 +451,7 @@ impl Database {
                 UPDATE roles
                 SET
                     name = ?2, description = ?3
-                WHERE id = ?1
+                WHERE id = ?1 and name != 'su'
                 ",
                 params![new_info.id, new_info.name, new_info.description]
             )?;
