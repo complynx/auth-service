@@ -224,20 +224,24 @@ impl std::fmt::Display for PermissionDescription {
 
 impl Database {
     pub async fn new() -> Result<Self, Box<dyn Error>> {
+        #[cfg(feature="sqlcipher")]
         let secret = std::env::var("SQLITE_SECRET").ok();
+
         let path = std::env::var("SQLITE_PATH")?;
         let db_file = format!("{}/auth.db", path);
 
         let conn = Connection::open(db_file).await?;
         log::debug!("open ok");
+
+        #[cfg(feature="sqlcipher")]
         if let Some(secret_str) = secret {
             let secret_str = secret_str.replace("'", "''");
             let sql_command = format!("PRAGMA KEY='{}'", secret_str);
             conn.call(move |conn| {
                 conn.execute(&sql_command, params![])
             }).await?;
+            log::debug!("pragma ok");
         }
-        log::debug!("pragma ok");
         conn.call(|conn| {
             prepare_database(&conn)
         }).await?;
