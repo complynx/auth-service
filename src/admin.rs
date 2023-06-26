@@ -1,4 +1,5 @@
-use actix_web::{web, get, HttpResponse, HttpRequest, Responder, post, put};
+use actix_web::{web, get, HttpResponse, HttpRequest, Responder, post, put, delete};
+use rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -10,11 +11,15 @@ pub(crate) const PERMISSION_VIEW_USER_ROLES: &str = "view_user_roles";
 pub(crate) const PERMISSION_MANAGE_USER_ROLES: &str = "manage_user_roles";
 pub(crate) const PERMISSION_VIEW_ROLES: &str = "view_roles";
 pub(crate) const PERMISSION_MANAGE_ROLES: &str = "manage_roles";
+pub(crate) const PERMISSION_DELETE_ROLES: &str = "delete_roles";
 pub(crate) const PERMISSION_CREATE_ROLES: &str = "create_roles";
+pub(crate) const PERMISSION_VIEW_ROLE_USERS: &str = "view_role_users";
 pub(crate) const PERMISSION_VIEW_ROLE_PERMISSIONS: &str = "view_role_permissions";
 pub(crate) const PERMISSION_MANAGE_ROLE_PERMISSIONS: &str = "manage_role_permissions";
 pub(crate) const PERMISSION_VIEW_PERMISSIONS: &str = "view_permissions";
+pub(crate) const PERMISSION_VIEW_PERMISSION_ROLES: &str = "view_permission_roles";
 pub(crate) const PERMISSION_MANAGE_PERMISSIONS: &str = "manage_permissions";
+pub(crate) const PERMISSION_DELETE_PERMISSIONS: &str = "delete_permissions";
 pub(crate) const PERMISSION_CREATE_PERMISSIONS: &str = "create_permissions";
 
 pub(crate) const MAX_PERMISSION_LENGTH: usize = 30;
@@ -108,6 +113,35 @@ async fn get_role(
     HttpResponse::Ok().json(role)
 }
 
+#[get("/role/{id}/users")]
+async fn get_role_users(
+    id: web::Path<i64>,
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    log::debug!("request: {:?}", req);
+    let token = U!(check_session(req, app_data.clone()).await);
+    let current_user = U!(get_current_user(&app_data, &token).await);
+    U!(permit(&current_user, PERMISSION_VIEW_ROLE_USERS).await);
+
+    let role = U!(app_data.as_ref().database.get_role(*id).await.map_err(|err| if is_not_found(&err) {
+        HttpResponse::NotFound().json(ErrorResponse{error:"role not found".to_string()})
+    } else {
+        log::error!("failed to fetch role: {}", err);
+        err_internal()
+    }));
+
+    let users = U!(app_data.as_ref().database.get_role_users(*id).await.map_err(|err| {
+        log::error!("failed to fetch role users: {}", err);
+        err_internal()
+    }));
+
+    HttpResponse::Ok().json(json!({
+        "role": role,
+        "users": users,
+    }))
+}
+
 #[post("/role/{id}")]
 async fn edit_role(
     id: web::Path<i64>,
@@ -147,6 +181,72 @@ async fn edit_role(
     }));
 
     HttpResponse::Ok().json(role)
+}
+
+#[delete("/role/{id}")]
+async fn delete_role(
+    id: web::Path<i64>,
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    log::debug!("request: {:?}", req);
+    let token = U!(check_session(req, app_data.clone()).await);
+    let current_user = U!(get_current_user(&app_data, &token).await);
+    U!(permit(&current_user, PERMISSION_DELETE_ROLES).await);
+
+    let role = U!(app_data.as_ref().database.get_role(*id).await.map_err(|err| if is_not_found(&err) {
+        HttpResponse::Ok().json(json!({
+            "success": true
+        }))
+    } else {
+        log::error!("failed to fetch role: {}", err);
+        err_internal()
+    }));
+
+    log::info!("role delete. {}, Role: {}", current_user, role);
+
+    U!(app_data.as_ref().database.delete_role(*id).await.map_err(|err| {
+        match err.downcast_ref::<tokio_rusqlite::Error>() {
+            Some(tokio_rusqlite::Error::Rusqlite(err_down)) => match err_down {
+                rusqlite::Error::SqliteFailure(err_ffi, Some(ostr)) => {
+                    match err_ffi.extended_code {
+                        SQLITE_CONSTRAINT_FOREIGNKEY => {
+                            log::error!("failed to delete role because of constraint: {}: {}", err_ffi, ostr);
+                            return HttpResponse::Conflict().json(json!({
+                                "code": SQLITE_CONSTRAINT_FOREIGNKEY,
+                                "reason": ostr
+                            }))
+                        },
+                        _ => {
+                            log::error!("failed to delete role, sqlite error: {}: {}", err_ffi, ostr);
+                            return HttpResponse::Conflict().json(json!({
+                                "code": 0,
+                                "reason": "other"
+                            }))
+                        },
+                    }
+                },
+                rusqlite::Error::SqliteFailure(err_ffi, None) => {
+                    log::error!("failed to delete role, sqlite error: {}", err_ffi);
+                    return HttpResponse::Conflict().json(json!({
+                        "code": 0,
+                        "reason": "other"
+                    }))
+                },
+                _ => {
+                    log::error!("failed to delete role, rusqlite error: {}", err_down);
+                }
+            },
+            _ => {}
+        };
+        log::error!("failed to delete role, other error: {}", err);
+        
+        err_internal()
+    }));
+
+    HttpResponse::Ok().json(json!({
+        "success": true
+    }))
 }
 
 #[put("/role")]
@@ -296,6 +396,36 @@ async fn get_permission(
     HttpResponse::Ok().json(permission)
 }
 
+#[get("/permission/{id}/roles")]
+async fn get_permission_roles(
+    id: web::Path<i64>,
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    log::debug!("request: {:?}", req);
+    let token = U!(check_session(req, app_data.clone()).await);
+    let current_user = U!(get_current_user(&app_data, &token).await);
+    U!(permit(&current_user, PERMISSION_VIEW_PERMISSION_ROLES).await);
+
+    let permission = U!(app_data.as_ref().database.get_permission(id.clone()).await.map_err(|err|
+    if is_not_found(&err) {
+        HttpResponse::NotFound().json(ErrorResponse{error:"permission not found".to_string()})
+    } else {
+        log::error!("failed to fetch permission: {}", err);
+        err_internal()
+    }));
+
+    let roles = U!(app_data.as_ref().database.get_permission_roles(*id).await.map_err(|err|{
+        log::error!("failed to fetch permission roles: {}", err);
+        err_internal()
+    }));
+
+    HttpResponse::Ok().json(json!({
+        "permission": permission,
+        "roles": roles,
+    }))
+}
+
 #[post("/permission/{id}")]
 async fn edit_permission(
     id: web::Path<i64>,
@@ -337,6 +467,73 @@ async fn edit_permission(
     }));
 
     HttpResponse::Ok().json(permission)
+}
+
+#[delete("/permission/{id}")]
+async fn delete_permission(
+    id: web::Path<i64>,
+    req: HttpRequest,
+    app_data: web::Data<AppData>,
+) -> impl Responder {
+    log::debug!("request: {:?}", req);
+    let token = U!(check_session(req, app_data.clone()).await);
+    let current_user = U!(get_current_user(&app_data, &token).await);
+    U!(permit(&current_user, PERMISSION_DELETE_PERMISSIONS).await);
+
+    let permission = U!(app_data.as_ref().database.get_permission(id.clone()).await.map_err(|err|
+    if is_not_found(&err) {
+        HttpResponse::Ok().json(json!({
+            "success": true
+        }))
+    } else {
+        log::error!("failed to fetch permission: {}", err);
+        err_internal()
+    }));
+
+    log::info!("permission delete. {}, Permission: {}", current_user, permission);
+
+    U!(app_data.as_ref().database.delete_permission(id.clone()).await.map_err(|err|{
+        match err.downcast_ref::<tokio_rusqlite::Error>() {
+            Some(tokio_rusqlite::Error::Rusqlite(err_down)) => match err_down {
+                rusqlite::Error::SqliteFailure(err_ffi, Some(ostr)) => {
+                    match err_ffi.extended_code {
+                        SQLITE_CONSTRAINT_FOREIGNKEY => {
+                            log::error!("failed to delete permission because of constraint: {}: {}", err_ffi, ostr);
+                            return HttpResponse::Conflict().json(json!({
+                                "code": SQLITE_CONSTRAINT_FOREIGNKEY,
+                                "reason": ostr
+                            }))
+                        },
+                        _ => {
+                            log::error!("failed to delete permission, sqlite error: {}: {}", err_ffi, ostr);
+                            return HttpResponse::Conflict().json(json!({
+                                "code": 0,
+                                "reason": "other"
+                            }))
+                        },
+                    }
+                },
+                rusqlite::Error::SqliteFailure(err_ffi, None) => {
+                    log::error!("failed to delete permission, sqlite error: {}", err_ffi);
+                    return HttpResponse::Conflict().json(json!({
+                        "code": 0,
+                        "reason": "other"
+                    }))
+                },
+                _ => {
+                    log::error!("failed to delete permission, rusqlite error: {}", err_down);
+                }
+            },
+            _ => {}
+        };
+        log::error!("failed to delete permission, other error: {}", err);
+        
+        err_internal()
+    }));
+
+    HttpResponse::Ok().json(json!({
+        "success": true
+    }))
 }
 
 #[put("/permission")]
@@ -525,11 +722,15 @@ pub fn init() -> actix_web::Scope {
         .service(get_roles)
         .service(get_role)
         .service(edit_role)
+        .service(delete_role)
         .service(create_role)
+        .service(get_role_users)
         .service(get_role_permissions)
         .service(change_role_permissions)
         .service(get_permissions)
         .service(get_permission)
+        .service(get_permission_roles)
         .service(edit_permission)
+        .service(delete_permission)
         .service(create_permission)
 }

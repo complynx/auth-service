@@ -111,11 +111,15 @@ fn prepare_database(conn: &rusqlite::Connection) -> Result<()> {
             (crate::admin::PERMISSION_MANAGE_USER_ROLES, ""),
             (crate::admin::PERMISSION_VIEW_ROLES, ""),
             (crate::admin::PERMISSION_MANAGE_ROLES, ""),
+            (crate::admin::PERMISSION_DELETE_ROLES, ""),
             (crate::admin::PERMISSION_CREATE_ROLES, ""),
+            (crate::admin::PERMISSION_VIEW_ROLE_USERS, ""),
             (crate::admin::PERMISSION_VIEW_ROLE_PERMISSIONS, ""),
             (crate::admin::PERMISSION_MANAGE_ROLE_PERMISSIONS, ""),
             (crate::admin::PERMISSION_VIEW_PERMISSIONS, ""),
+            (crate::admin::PERMISSION_VIEW_PERMISSION_ROLES, ""),
             (crate::admin::PERMISSION_MANAGE_PERMISSIONS, ""),
+            (crate::admin::PERMISSION_DELETE_PERMISSIONS, ""),
             (crate::admin::PERMISSION_CREATE_PERMISSIONS, ""),
         ]);
 
@@ -295,6 +299,52 @@ impl Database {
         result
     }
 
+    pub async fn get_role_users(&self, id: i64) -> Result<Vec<UserOuterDescription>, Box<dyn Error>> {
+        #[derive(Clone)]
+        struct UserOuterInterim {
+            id: i64,
+            issuer: String,
+            outer_id: String,
+            data: String,
+        }
+        let ret = self.conn.call(move |conn| {
+            let mut query = conn.prepare("
+                SELECT
+                    user_oauth.user_id, user_oauth.issuer, user_oauth.outer_id, user_oauth.data
+                FROM user_roles
+                INNER JOIN user_oauth ON user_oauth.user_id = user_roles.user
+                WHERE user_roles.role = ?1
+            ")?;
+            let rows = query.query_map(
+                params![id],
+                |row| Ok(UserOuterInterim{
+                    id: row.get(0)?,
+                    issuer: row.get(1)?,
+                    outer_id: row.get(2)?,
+                    data: row.get(3)?,
+                })
+            )?;
+            let mut ret = Vec::new();
+            for role in rows {
+                ret.push(role?);
+            }
+            Ok(ret)
+        }).await?;
+        let result: Result<Vec<UserOuterDescription>, Box<dyn std::error::Error>> = ret
+            .into_iter()
+            .map(|interim| {
+                let data: serde_json::Value = serde_json::from_str(&interim.data)?;
+                Ok(UserOuterDescription {
+                    id: interim.id,
+                    issuer: interim.issuer,
+                    outer_id: interim.outer_id,
+                    data,
+                })
+            })
+            .collect();
+        result
+    }
+
     pub async fn get_user(&self, id: i64) -> Result<UserOuterDescription, Box<dyn Error>> {
         #[derive(Clone)]
         struct UserOuterInterim {
@@ -412,6 +462,19 @@ impl Database {
         Ok(())
     }
 
+    pub async fn delete_permission(&self, id: i64) -> Result<(), Box<dyn Error>> {
+        self.conn.call(move |conn| {
+            conn.execute("
+                DELETE from permissions
+                WHERE id = ?1
+                ",
+                params![id]
+            )?;
+            Ok(())
+        }).await?;
+        Ok(())
+    }
+
     pub async fn create_permission(&self, data: PermissionDescription) -> Result<i64, Box<dyn Error>> {
         let ret = self.conn.call(move |conn| {
             conn.execute("
@@ -459,6 +522,19 @@ impl Database {
         }).await?;
         Ok(())
     }
+    
+    pub async fn delete_role(&self, id: i64) -> Result<(), Box<dyn Error>> {
+        self.conn.call(move |conn| {
+            conn.execute("
+                DELETE from roles
+                WHERE id = ?1 and name != 'su'
+                ",
+                params![id]
+            )?;
+            Ok(())
+        }).await?;
+        Ok(())
+    }
 
     pub async fn create_role(&self, new_info: RoleDescription) -> Result<i64, Box<dyn Error>> {
         let new_id = self.conn.call(move |conn| {
@@ -484,6 +560,32 @@ impl Database {
             let rows = query.query_map(
                 params![id],
                 |row| Ok(PermissionDescription{
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                })
+            )?;
+            let mut ret = Vec::new();
+            for role in rows {
+                ret.push(role?);
+            }
+            Ok(ret)
+        }).await?;
+        Ok(ret)
+    }
+    
+    pub async fn get_permission_roles(&self, id: i64) -> Result<Vec<RoleDescription>, Box<dyn Error>> {
+        let ret = self.conn.call(move |conn| {
+            let mut query = conn.prepare("
+                SELECT
+                    roles.id, roles.name, roles.description
+                FROM roles
+                INNER JOIN role_permissions ON roles.id = role_permissions.role
+                WHERE role_permissions.permission = ?1
+            ")?;
+            let rows = query.query_map(
+                params![id],
+                |row| Ok(RoleDescription{
                     id: row.get(0)?,
                     name: row.get(1)?,
                     description: row.get(2)?,
@@ -567,7 +669,11 @@ pub struct UserRoleDescription {
 
 pub fn is_not_found(err: &Box<dyn Error>) -> bool {
     match err.downcast_ref::<rusqlite::Error>() {
-        Some(rusqlite::Error::QueryReturnedNoRows) => true,
+        Some(rusqlite::Error::QueryReturnedNoRows) => return true,
+        _ => {}
+    }
+    match err.downcast_ref::<tokio_rusqlite::Error>() {
+        Some(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => return true,
         _ => false
     }
 }
