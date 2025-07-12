@@ -242,12 +242,13 @@ impl Database {
             let secret_str = secret_str.replace("'", "''");
             let sql_command = format!("PRAGMA KEY='{}'", secret_str);
             conn.call(move |conn| {
-                conn.execute(&sql_command, params![])
+                conn.execute(&sql_command, params![])?;
+                Ok(())
             }).await?;
             log::debug!("pragma ok");
         }
         conn.call(|conn| {
-            prepare_database(&conn)
+            Ok(prepare_database(&conn)?)
         }).await?;
         
         Ok(Self{
@@ -764,7 +765,8 @@ impl User {
                         user_id = ?1
                 ",
                 params![inner_id, data_str]
-            )
+            )?;
+            Ok(())
         }).await?;
 
         Ok(())
@@ -838,7 +840,8 @@ impl User {
                 )
                 ",
                 params![inner_id, role_name_borrow]
-            )
+            )?;
+            Ok(())
         }).await?;
         self.roles.remove(&role_name);
         Ok(())
@@ -870,7 +873,8 @@ impl User {
                     "
                 },
                 params![inner_id, &role_name_borrow, if shareable { 1 } else { 0 }]
-            )
+            )?;
+            Ok(())
         }).await?;
         self.roles.insert(role_name);
         Ok(())

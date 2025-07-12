@@ -1,5 +1,5 @@
 # Use a Rust base image
-FROM rust:latest as builder
+FROM rust:latest AS builder
 
 # Set the working directory to /app
 WORKDIR /app
@@ -27,13 +27,14 @@ COPY src ./src
 RUN cargo build --release
 
 # Use a minimal runtime image
-FROM debian:buster-slim
+FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y libsqlcipher0
-
-# Install SSL certificates
+# Install required runtime libraries and SSL certificates
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends \
+        libsqlcipher0 \
+        libssl3 \
+        ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Set the working directory to /app

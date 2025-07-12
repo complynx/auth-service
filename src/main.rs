@@ -38,6 +38,7 @@ const LOGIN_SUCCESS_HEADER: &str = "X-Login-Success";
 
 const HAS_PERMISSION_HEADER: &str = "X-Has-Permission";
 
+#[allow(dead_code)]
 #[derive(Serialize, Debug)]
 struct LoginResponse {
     session_id: String,
